@@ -33,26 +33,46 @@ visual contact and stops on extraction clearance, the travel limit, or the force
 safety threshold. The policy excludes layer 16 because repeatability checks
 found that selecting this second-to-top layer can destabilize the upper tower.
 
-## Existing environment
+## Environment setup
 
-Use the existing Anaconda `pybullet` environment. PyBullet, OpenCV, NumPy, and
-Matplotlib are already available there:
+Use an Anaconda or Miniconda installation with Conda available in Anaconda
+Prompt or a Conda-enabled PowerShell terminal. Python 3.10 is the tested
+version. From the repository directory, create and activate an environment,
+then install the runtime libraries:
 
 ```powershell
-& 'C:\Users\pro7t\anaconda3\envs\pybullet\python.exe' -m unittest -v
+conda create -n jenga-robot python=3.10 pip -y
+conda activate jenga-robot
+python -m pip install pybullet numpy opencv-python matplotlib
 ```
+
+The project uses PyBullet (including its `pybullet_data` assets), NumPy,
+OpenCV's Python package (`opencv-python`, imported as `cv2`), and Matplotlib.
+No separate installation is needed for `pybullet_data`; it is included with
+PyBullet. The Python standard library and `unittest` are used for other
+functionality and require no additional packages.
+
+Verify the installation by running the tests:
+
+```powershell
+python -m unittest -v
+```
+
+If you already have the project's Anaconda `pybullet` environment, you can
+reuse it instead of creating a new one by running `conda activate pybullet`.
+Run the remaining commands from the activated environment.
 
 Run one headless game with simulator ground-truth perception and closed-loop
 control:
 
 ```powershell
-& 'C:\Users\pro7t\anaconda3\envs\pybullet\python.exe' .\jenga_replication.py --detector ground_truth --controller closed_loop --trials 1 --output results
+python .\jenga_replication.py --detector ground_truth --controller closed_loop --trials 1 --output results
 ```
 
 Run the 18-trial evaluation requested in the presentation:
 
 ```powershell
-& 'C:\Users\pro7t\anaconda3\envs\pybullet\python.exe' .\jenga_replication.py --compare --trials 18 --output results
+python .\jenga_replication.py --compare --trials 18 --output results
 ```
 
 `--compare` evaluates both detectors against both open-loop and closed-loop
