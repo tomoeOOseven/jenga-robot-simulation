@@ -101,7 +101,11 @@ Useful options: `--max-attempts`, `--seed`, `--block-mass-kg`,
   `alignment_and_servo.png` (Figs. 8 and 9), and `trajectories.png`.
 
 An attempt is **successful** if the block is extracted, or correctly found
-immobile, without collapsing the tower (paper section 4.5). Errors are
+immobile, without collapsing the tower (paper section 4.5). The tower counts as
+collapsed when any other block falls: it drops, tilts more than 20°, or slides
+half a block length. Smaller drags of nearby blocks are reported as tower
+perturbation. A target that tips out of the tower before the finger finishes
+the push counts as extracted, since it has left the tower. Errors are
 unreachable poses, lost tracking, servo timeouts, and pushes that do not clear
 the block (for example, a side block that yaws off the finger).
 

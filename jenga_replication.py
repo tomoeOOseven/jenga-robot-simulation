@@ -598,19 +598,29 @@ class Tower:
             for b in self.blocks if b.status != "extracted"
         }
 
+    def has_fallen(self, block: Block) -> bool:
+        """True if the block dropped or tipped over since its baseline pose."""
+        position, rotation = self.pose(block)
+        start, start_rotation = self.initial_poses[block.block_id]
+        if start[2] - position[2] > self.config.block_height * 0.5:
+            return True
+        return float(np.dot(rotation[:, 2], start_rotation[:, 2])) < math.cos(math.radians(20))
+
     def has_collapsed(self, exclude: Optional[int] = None) -> bool:
-        """True if any remaining block (other than `exclude`) left its place."""
+        """True if any remaining block (other than `exclude`) fell from its place.
+
+        A block that is only dragged a little and stays on its layer is a
+        disturbance (reported as tower perturbation), not a collapse.
+        """
         cfg = self.config
         for block in self.blocks:
             if block.status == "extracted" or block.block_id == exclude:
                 continue
-            position, rotation = self.pose(block)
+            position, _ = self.pose(block)
             start, _ = self.initial_poses[block.block_id]
-            if np.linalg.norm(position[:2] - start[:2]) > cfg.block_width * 0.8:
+            if np.linalg.norm(position[:2] - start[:2]) > cfg.block_length * 0.5:
                 return True
-            if start[2] - position[2] > cfg.block_height * 0.8:
-                return True
-            if rotation[2, 2] < math.cos(math.radians(20)):
+            if self.has_fallen(block):
                 return True
         return False
 
@@ -1545,6 +1555,12 @@ class JengaSimulation:
                 cfg.approach_distance + max(0.0, displacement or 0.0)))
             self._move_linear(retreat, cfg.approach_speed_m_s, trajectory)
         self._hold(0.5)
+        # A target that lost the finger and tipped out of the tower has been
+        # extracted: in the paper such blocks fall out behind the tower.
+        if (block.status != "extracted" and reason in ("push_incomplete", "push_jammed")
+                and self.tower.has_fallen(block)):
+            self.tower.remove(block)
+            outcome, reason = "extracted", ""
         # A half-pushed target is a failed attempt, not a collapse; later
         # checks measure it from where it was left.
         collapsed = self.tower.has_collapsed(exclude=block.block_id)
