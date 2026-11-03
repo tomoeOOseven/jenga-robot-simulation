@@ -125,7 +125,11 @@ the block (for example, a side block that yaws off the finger).
 - The OpenCV detector is a classical baseline, not a trained YOLACT++ model.
   Block faces are drawn with dark seams (like chamfered edges) so touching faces
   can be separated. The ViSP tracker is replaced by per-frame detection plus
-  data association.
+  data association. Each image registers the tower map first (snap to the
+  layer and slot grid, then refine), because camera calibration error shifts
+  every detected face by several mm, differently at each arm pose. The servo
+  picks its target in the first close-up frame by level and slot on this map,
+  then follows the nearest detection.
 - Blocks are not re-placed on top (as in the paper's robotic setting), and the
   tower is not repositioned between sub-spaces; the Panda reaches every level.
 - Results are simulation outcomes, not a physical replication.

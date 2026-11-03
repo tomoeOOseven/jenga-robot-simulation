@@ -663,15 +663,55 @@ class TowerMap:
         slot = int(round(lateral / pitch + (cfg.blocks_per_layer - 1) / 2))
         if not 0 <= slot < cfg.blocks_per_layer:
             return None
-        nominal, _ = self.nominal_face(layer, slot)
-        if np.linalg.norm(nominal - center) > tolerance:
+        nominal, nominal_normal = self.nominal_face(layer, slot)
+        residual = center - nominal
+        depth = float(np.dot(residual, nominal_normal))
+        # Faces are told apart in-plane; depth varies with per-block jitter,
+        # half-pushed blocks and depth-sensor bias, so it is gated loosely.
+        if np.linalg.norm(residual - depth * nominal_normal) > tolerance or abs(depth) > 0.03:
             return None
         return layer, slot
 
+    def _coarse_align(self, observations: Sequence[FaceObservation]) -> None:
+        """Snap the grid to the faces before fine registration.
+
+        Camera calibration error can shift every face by more than half a
+        layer, which would make association pick the wrong layer. Each face is
+        compared with the nearest layer of its own orientation (every second
+        layer, so +-15 mm is unambiguous) and the nearest slot, and the grid is
+        moved by the median offset.
+        """
+        cfg = self.config
+        pitch = cfg.block_width + cfg.block_gap_m
+        offsets: list[list[float]] = [[], [], []]
+        for obs in observations:
+            if obs.world_center is None or obs.world_normal is None:
+                continue
+            if obs.world_normal[0] > 0.85:
+                parity, lateral_axis = 0, 1
+            elif obs.world_normal[1] < -0.85:
+                parity, lateral_axis = 1, 0
+            else:
+                continue
+            height = obs.world_center[2] - self.origin[2] - cfg.block_height * (parity + 0.5)
+            period = 2 * cfg.block_height
+            offsets[2].append(height - period * round(height / period))
+            lateral = obs.world_center[lateral_axis] - self.origin[lateral_axis]
+            offsets[lateral_axis].append(lateral - pitch * round(lateral / pitch))
+        for axis, values in enumerate(offsets):
+            if len(values) >= 3:
+                self.origin[axis] += float(np.median(values))
+
     def register(self, observations: Sequence[FaceObservation]) -> None:
-        """Refine the tower origin from the residuals of associated faces."""
+        """Refine the tower origin from the in-plane residuals of associated faces.
+
+        Each face only measures the origin across its own plane: x-facing
+        faces give y and z, y-facing faces give x and z. Depth is ignored
+        because it depends on per-block jitter.
+        """
+        self._coarse_align(observations)
         for _ in range(2):
-            residuals = []
+            per_axis: list[list[float]] = [[], [], []]
             for obs in observations:
                 if obs.world_center is None:
                     continue
@@ -680,13 +720,14 @@ class TowerMap:
                     continue
                 nominal, normal = self.nominal_face(*key)
                 residual = obs.world_center - nominal
-                # Depth of the face plane depends on per-block jitter; only the
-                # in-plane components register the grid.
-                residual -= normal * float(np.dot(residual, normal))
-                residuals.append(residual)
-            if len(residuals) < 4:
+                for axis in range(3):
+                    if abs(normal[axis]) < 0.5:
+                        per_axis[axis].append(float(residual[axis]))
+            if sum(len(values) for values in per_axis) < 8:
                 return
-            self.origin += np.median(np.asarray(residuals), axis=0)
+            for axis, values in enumerate(per_axis):
+                if len(values) >= 3:
+                    self.origin[axis] += float(np.median(values))
 
 
 # --------------------------------------------------------------------------
@@ -1377,8 +1418,26 @@ class JengaSimulation:
         face_in_tool = invert_pose(tool_in_face(self.config.probe_clearance))
         return self.tool_in_camera @ face_in_tool
 
-    def _track(self, block: Block, predicted_world: np.ndarray) -> Optional[FaceObservation]:
+    def _track(self, block: Block, predicted_world: np.ndarray, locked: bool = True) -> Optional[FaceObservation]:
+        """Find the target face in the close-up image.
+
+        The first match (`locked=False`) cannot compare world positions with
+        the overview estimate: both depend on the arm's calibration error,
+        which differs between the two poses. Like the overview, it registers
+        the tower map from the close-up image and picks the face associated
+        with the target's level and slot. Once locked, the prediction is the
+        last close-up detection and a tight gate keeps the track continuous.
+        """
         model_camera = self.arm.camera_pose()
+        if not locked and self.detector_mode == "opencv":
+            observations = self._detect()
+            local_map = TowerMap(self.config)
+            local_map.origin = self.map.origin.copy()
+            local_map.register(observations)
+            for obs in observations:
+                if local_map.associate(obs.world_center, obs.world_normal) == (block.layer, block.slot):
+                    return obs
+            return None
         predicted_cam = invert_pose(model_camera) @ np.append(predicted_world, 1.0)
         pixel = self.vision.project(predicted_cam[:3])
         roi = None if pixel is None else (pixel[0], pixel[1], 90.0)
@@ -1400,10 +1459,11 @@ class JengaSimulation:
         start_time = self.sim_time
         misses = 0
         iterations = 0
+        locked = False
         twist_world = np.zeros(6)
         while self.sim_time - start_time < cfg.max_servo_seconds:
             iterations += 1
-            obs = self._track(block, estimate)
+            obs = self._track(block, estimate, locked)
             if obs is None:
                 misses += 1
                 if misses > cfg.max_tracking_misses:
@@ -1412,6 +1472,7 @@ class JengaSimulation:
                 twist_world = np.zeros(6)
             else:
                 misses = 0
+                locked = True
                 estimate = obs.world_center
                 current = make_pose(obs.rotation_cam, obs.center_cam)
                 camera_twist, _ = visual_servo_twist(current, desired, cfg.servo_gain)
@@ -1548,7 +1609,10 @@ class JengaSimulation:
                 self._move_linear(goal, cfg.approach_speed_m_s / 2, trajectory)
                 self._hold(0.15)
             if not reason:
-                alignment = self._alignment_error(block)
+                # If the approach already knocked the tower over, the target
+                # has moved and an alignment error would be meaningless.
+                if not self.tower.has_collapsed(exclude=block.block_id):
+                    alignment = self._alignment_error(block)
                 outcome, reason, peak, profile, displacement = self._push(block, threshold, trajectory)
             back = self.arm.tool_pose()
             retreat = make_pose(back[:3, :3], back[:3, 3] - back[:3, 2] * (
