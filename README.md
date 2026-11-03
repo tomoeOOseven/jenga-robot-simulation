@@ -1,44 +1,52 @@
-# Jenga-playing robot simulation
+# Jenga-playing robot: simulated replication in PyBullet
 
-This project implements the robotics pipeline described in the presentation
-using PyBullet's Franka Panda and an 18-layer, 54-block Jenga tower:
+A PyBullet replication of Marchionna et al. (2023), *Deep Instance Segmentation
+and Visual Servoing to Play Jenga with a Cost-Effective Robotic System*
+(`2211.07977v2.pdf`), following the AR523 presentation. A 7-DOF Franka Panda
+with an eye-in-hand RGB-D camera and a pushing finger plays an 18-level,
+54-block tower.
 
-- an eye-in-hand overview scan that provides image-confirmed candidates before
-  the block-selection policy chooses a target;
-- simulator segmentation as a ground-truth perception baseline and an OpenCV
-  color/depth candidate detector with target pose estimation for comparison;
-- a two-subspace block policy with per-block state and one extraction per level
-  (the current Panda/camera setup uses validated layers 4 through 15);
-- Panda inverse kinematics and a trapezoidal joint-space approach trajectory;
-- eye-in-hand RGB-D feedback, Jacobian differential kinematics, and a 7 mm
-  contact-alignment tolerance;
-- 240 Hz simulated contact-force feedback during visually guided pushing, with
-  force traces logged at 20 Hz, a 0.23 N target, and the presentation's 0.32 N
-  safety cutoff;
-- open-loop/closed-loop comparisons and per-trial CSV, JSON, and plot outputs.
+## Pipeline
 
-The overview scan evaluates all present block faces from image color and depth
-before the policy selects among visible, eligible blocks. The OpenCV path uses
-the known tower grid as a data-association prior, but does not receive a
-preselected target block: it checks the image color and depth at every
-projected candidate face, then the policy chooses among image-confirmed
-candidates. It remains a map-assisted classical vision baseline, not a trained
-YOLACT++ model. Likewise, the original paper's ViSP model-based tracker and
-physical e.DO setup are not included; this implementation targets the
-presentation pipeline on the available Panda/PyBullet assets. During pushing,
-visual updates keep the end effector aligned when the block is visible; when
-the probe occludes it, the last valid image estimate is held while the force
-loop governs push speed. The planned push continues through temporary loss of
-visual contact and stops on extraction clearance, the travel limit, or the force
-safety threshold. The policy excludes layer 16 because repeatability checks
-found that selecting this second-to-top layer can destabilize the upper tower.
+| Stage | Paper / presentation | This implementation |
+|---|---|---|
+| 1. Detection | YOLACT++ masks, PnP, ViSP tracker | `ground_truth`: perfect simulator masks and poses. `opencv`: colour threshold, depth edges and contours, PnP on face corners, depth refinement, then association with a tower map registered from the image. The OpenCV path never reads simulator poses. |
+| 2. Selection | Two sub-spaces, random start, memory buffer, one extraction per level | Same. 14 levels (2–15), so the paper's minimum of 42 attempts holds. The first sub-space uses 0.32 N; once it is fully tested the policy switches sub-space and uses 0.18 N. After an immobile block it tries the rest of that level, centre block first. |
+| 3. Approach | IK + trapezoidal trajectory | Damped least-squares IK on the controller's kinematic model, a trapezoidal joint-space move to a staging pose, then a straight-line approach |
+| 4. Alignment and push | 2½-D visual servo `v = -λ L⁺ e`, s = (x, y, log Z/Z*, θu), ~9 Hz; open-loop push with a 1-D force sensor at 20 Hz | Same control law and rates. The camera twist is mapped to joints with the Jacobian pseudo-inverse. The push runs at constant speed and stops when the tared, 12-bit sensor reading exceeds the phase threshold (immobile) or the block clears the tower (extracted). |
+
+The threshold is a classification test. It applies until the block has slid
+15 mm, which proves it is mobile. After that the push continues under a 0.64 N
+safety limit. Near the end of an extraction the block tips against the level
+above and friction rises, so applying the threshold all the way would wrongly
+stop pushes on blocks that are already almost out. An "immobile" call only
+counts as correct if the finger was touching the target block alone; otherwise
+(for example, a misaligned finger pressing on the level above) it is scored as
+an error.
+
+The 1-D force sensor is a spring-loaded fingertip on a prismatic joint
+(100 N/m), so its readings come from the simulated contact. It only senses
+force along the finger, like the paper's FMA sensor.
+
+### Modelled error sources
+
+Simulation is too perfect by default, so these real-world effects are modelled:
+
+- **Block tolerances**: each block's height varies (σ = 0.1 mm), plus ±0.5 mm
+  placement jitter. Different towers then have different friction patterns,
+  which is why the paper says vision alone cannot classify removability.
+- **Robot calibration error**: the controller reads joint encoders with a fixed
+  per-joint offset (σ = 0.17°). Its kinematic model, IK and camera pose are
+  slightly wrong; images are always rendered from the true camera pose.
+- **Depth sensor**: per-pixel noise and a ±1 % systematic scale error per camera.
+
+The closed-loop servo measures the block relative to the camera, so it is
+largely immune to the first two. The open-loop (IK-only) baseline plans from
+the overview estimate and is not.
 
 ## Environment setup
 
-Use an Anaconda or Miniconda installation with Conda available in Anaconda
-Prompt or a Conda-enabled PowerShell terminal. Python 3.10 is the tested
-version. From the repository directory, create and activate an environment,
-then install the runtime libraries:
+Use Anaconda or Miniconda (Python 3.10 tested):
 
 ```powershell
 conda create -n jenga-robot python=3.10 pip -y
@@ -46,62 +54,74 @@ conda activate jenga-robot
 python -m pip install pybullet numpy opencv-python matplotlib
 ```
 
-The project uses PyBullet (including its `pybullet_data` assets), NumPy,
-OpenCV's Python package (`opencv-python`, imported as `cv2`), and Matplotlib.
-No separate installation is needed for `pybullet_data`; it is included with
-PyBullet. The Python standard library and `unittest` are used for other
-functionality and require no additional packages.
-
-Verify the installation by running the tests:
+You can reuse an existing `pybullet` environment with `conda activate pybullet`.
+Run the tests (about 3 minutes; the `SimulationTests` class runs PyBullet):
 
 ```powershell
 python -m unittest -v
 ```
 
-If you already have the project's Anaconda `pybullet` environment, you can
-reuse it instead of creating a new one by running `conda activate pybullet`.
-Run the remaining commands from the activated environment.
+## Running
 
-Run one headless game with simulator ground-truth perception and closed-loop
-control:
+One game, ground-truth detection, closed loop:
 
 ```powershell
-python .\jenga_replication.py --detector ground_truth --controller closed_loop --trials 1 --output results
+python .\jenga_replication.py --trials 1 --output results
 ```
 
-Run the 18-trial evaluation requested in the presentation:
+The presentation's evaluation: every detector × controller pair on the same
+towers (trial *i* uses seed *i* for all four, so results are paired):
 
 ```powershell
 python .\jenga_replication.py --compare --trials 18 --output results
 ```
 
-`--compare` evaluates both detectors against both open-loop and closed-loop
-controllers. Add `--gui` for visualization. Each invocation writes
-`attempts.csv`, `summary.json`, `outcomes.png`, `force_profiles.png`, and
-`trajectories.png` under the selected output directory.
+Games run in parallel (`--workers`, default CPU count − 1). A game of about 40
+attempts takes roughly 10–15 minutes on one core, so the full 72-game run takes
+a few hours. Results are rewritten after every finished game, so you can look
+at partial results during a long run, and a game that crashes is reported
+without stopping the others. Add `--gui` to watch a game (this forces one
+worker).
 
-## Physical parameter caveat
+Useful options: `--max-attempts`, `--seed`, `--block-mass-kg`,
+`--friction-min/--friction-max`, `--height-tolerance-mm`, `--joint-bias-deg`
+(increase it to stress the open-loop baseline).
 
-The presentation-based model uses 75 x 25 x 15 mm blocks. The supplied
-mechanics paper reports a sample-average mass of 19.6 g, average dimensions of
-81 x 26 x 18 mm, and a typical hardwood static-friction coefficient of 0.4.
-The default simulation now uses the paper's 19.6 g and a fixed 0.4 PyBullet
-lateral-friction coefficient while retaining the presentation's dimensions;
-the dimensions therefore remain a deliberate, documented source difference.
-PyBullet's contact friction is only an approximation to the paper's static
-Coulomb model, not a calibrated static/kinetic wood model. The values are
-exposed as `--block-mass-kg`, `--friction-min`, and `--friction-max`, and the
-generated summary records them as assumptions.
+### Outputs
 
-The mechanics paper estimates about 0.23 N to initiate sliding in its
-simplified model. The force controller uses 0.23 N as its target and proportionally adjusts
-push-axis velocity at the 240 Hz simulation rate using the simulated contact
-force; force traces are recorded at 20 Hz. Axial speed is capped at 0.005 m/s,
-and the push stops at the presentation's 0.32 N safety cutoff. The
-presentation's 0.18 N and 0.32 N values also remain the policy's
-classification thresholds. Rigid simulated contact can still produce peaks
-above the cutoff within a physics step, so this is a simulated safety response
-rather than a validated force-limiting guarantee.
-Outcomes use measured axial travel and vertical displacement; the robot stops
-as soon as the block clears its layer. Results are simulation outcomes, not
-physical calibration or experimental replication scores.
+- `attempts.csv`: one row per attempt (level, slot, phase, threshold, outcome,
+  failure reason, peak force, alignment error h/v, servo time, block
+  displacement, tower perturbation, collapse).
+- `summary.json`: assumptions, configuration, and per-combination metrics with
+  mean ± std and 95 % t-intervals. Metrics include successful attempts per trial
+  (the paper's primary metric), extraction / immobile / error rates, failure
+  reasons, alignment error, fraction within 7 mm, servo time per level, and
+  peak force by outcome.
+- `outcomes.png` (cf. paper Fig. 10), `force_profiles.png` (Fig. 6),
+  `alignment_and_servo.png` (Figs. 8 and 9), and `trajectories.png`.
+
+An attempt is **successful** if the block is extracted, or correctly found
+immobile, without collapsing the tower (paper section 4.5). Errors are
+unreachable poses, lost tracking, servo timeouts, and pushes that do not clear
+the block (for example, a side block that yaws off the finger).
+
+## Physical parameters and limitations
+
+- Blocks are 75 × 25 × 15 mm (presentation and paper). Mass is 19.6 g and
+  friction μ = 0.4 (Ziglar 2006, `Analysis_of_Mechanics_in_Jenga.pdf`). None of
+  these are calibrated to a real set.
+- PyBullet's iterative solver under-resolves friction in a tall stack.
+  Breakaway forces keep rising with solver iterations, so 300 iterations are
+  used. Forces fall in the paper's 0–1 N range (lower levels about 0.5 N, upper
+  levels about 0.05 N) but are not exact Coulomb values.
+- Resting blocks sleep and use anchored friction. This stops the slow creep that
+  stacked boxes otherwise show in Bullet.
+- An extracted block is removed once it fully leaves the tower. In the paper it
+  falls behind the tower, out of the robot's reach.
+- The OpenCV detector is a classical baseline, not a trained YOLACT++ model.
+  Block faces are drawn with dark seams (like chamfered edges) so touching faces
+  can be separated. The ViSP tracker is replaced by per-frame detection plus
+  data association.
+- Blocks are not re-placed on top (as in the paper's robotic setting), and the
+  tower is not repositioned between sub-spaces; the Panda reaches every level.
+- Results are simulation outcomes, not a physical replication.
