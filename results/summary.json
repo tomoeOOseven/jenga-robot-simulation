@@ -1,0 +1,632 @@
+{
+  "assumptions": {
+    "block_mass_kg": 0.0196,
+    "block_friction_range": [
+      0.4,
+      0.4
+    ],
+    "block_height_tolerance_m": 0.0001,
+    "joint_bias_std_rad": 0.003,
+    "physical_parameters_are_calibrated": false,
+    "note": "Mass and friction come from the mechanics paper (Ziglar 2006); height tolerances and joint-encoder offsets are modelling choices. PyBullet friction is an approximation of Coulomb friction. Results are simulation outcomes, not a physical replication."
+  },
+  "configuration": {
+    "layers": 18,
+    "blocks_per_layer": 3,
+    "block_length": 0.075,
+    "block_width": 0.025,
+    "block_height": 0.015,
+    "block_mass_kg": 0.0196,
+    "block_friction_range": [
+      0.4,
+      0.4
+    ],
+    "block_height_tolerance_m": 0.0001,
+    "block_placement_jitter_m": 0.0005,
+    "block_gap_m": 0.0002,
+    "stand_height": 0.1,
+    "tower_origin": [
+      0.0,
+      0.0
+    ],
+    "robot_base": [
+      0.55,
+      -0.55,
+      0.0
+    ],
+    "finger_length": 0.17,
+    "fingertip_length": 0.02,
+    "probe_width": 0.011,
+    "probe_height": 0.009,
+    "camera_up_offset": 0.08,
+    "camera_back_offset": 0.15,
+    "joint_bias_std_rad": 0.003,
+    "sensor_stiffness_n_m": 100.0,
+    "sensor_damping_ratio": 0.7,
+    "fingertip_mass_kg": 0.02,
+    "sensor_full_scale_n": 5.0,
+    "sensor_bits": 12,
+    "sensor_hz": 20.0,
+    "first_force_threshold": 0.32,
+    "second_force_threshold": 0.18,
+    "classification_travel": 0.015,
+    "push_safety_force": 0.64,
+    "camera_width": 640,
+    "camera_height": 480,
+    "camera_fov": 60.0,
+    "camera_near": 0.02,
+    "camera_far": 2.0,
+    "depth_noise_m": 0.0005,
+    "depth_scale_error": 0.01,
+    "overview_distance": 0.3,
+    "time_step": 0.004166666666666667,
+    "solver_iterations": 300,
+    "servo_hz": 9.0,
+    "servo_gain": 1.5,
+    "servo_max_linear_m_s": 0.04,
+    "servo_max_angular_rad_s": 0.4,
+    "servo_tolerance_m": 0.0005,
+    "servo_tolerance_rad": 0.005,
+    "max_servo_seconds": 15.0,
+    "max_tracking_misses": 4,
+    "position_tolerance": 0.007,
+    "staging_distance": 0.2,
+    "approach_distance": 0.1,
+    "probe_clearance": 0.025,
+    "push_speed_m_s": 0.01,
+    "push_overtravel": 0.008,
+    "approach_speed_m_s": 0.05,
+    "max_joint_speed_rad_s": 1.0,
+    "min_level": 2,
+    "max_level": 15,
+    "max_attempts_per_block": 2,
+    "max_attempts_per_game": 60
+  },
+  "comparisons": {
+    "ground_truth_closed_loop": {
+      "trials": 18,
+      "attempts": 307,
+      "extracted": 102,
+      "immobile_classified": 180,
+      "errors": 25,
+      "tower_collapses": 12,
+      "successful_attempts": 282,
+      "extraction_rate": 0.3322475570032573,
+      "immobile_rate": 0.5863192182410424,
+      "error_rate": 0.08143322475570032,
+      "success_rate": 0.9185667752442996,
+      "failure_reasons": {
+        "push_incomplete": 6,
+        "tower_collapse": 12,
+        "tracking_lost": 7
+      },
+      "successful_attempts_per_trial": {
+        "n": 18,
+        "mean": 15.666666666666666,
+        "std": 8.891502883619381,
+        "ci95": 4.422026862042728
+      },
+      "max_successful_attempts": 27,
+      "extractions_per_trial": {
+        "n": 18,
+        "mean": 5.666666666666667,
+        "std": 3.3606722016672235,
+        "ci95": 1.6713690525446263
+      },
+      "max_extractions": 12,
+      "immobile_per_trial": {
+        "n": 18,
+        "mean": 10.0,
+        "std": 6.192975147412638,
+        "ci95": 3.079963288126849
+      },
+      "errors_per_trial": {
+        "n": 18,
+        "mean": 1.3888888888888888,
+        "std": 1.3779306261410682,
+        "ci95": 0.6852886764567789
+      },
+      "longest_success_streak_per_trial": {
+        "n": 18,
+        "mean": 14.5,
+        "std": 8.161963431602933,
+        "ci95": 4.059203715499083
+      },
+      "alignment_error_mm": {
+        "n": 298,
+        "mean": 0.1398664884643674,
+        "std": 0.06615121684440889,
+        "ci95": 0.007510792721093007
+      },
+      "alignment_error_h_mm": {
+        "n": 298,
+        "mean": 0.02707277278268387,
+        "std": 0.13736668796313065,
+        "ci95": 0.01559657961395971
+      },
+      "alignment_error_v_mm": {
+        "n": 298,
+        "mean": -0.03472778036187098,
+        "std": 0.056474740912306885,
+        "ci95": 0.006412128048489842
+      },
+      "within_7mm_rate": 1.0,
+      "servo_time_s": {
+        "n": 300,
+        "mean": 3.4577083333319645,
+        "std": 0.20849551240454173,
+        "ci95": 0.02359348828147186
+      },
+      "servo_time_s_by_level": {
+        "2": {
+          "n": 18,
+          "mean": 3.4749999999979924,
+          "std": 0.05752237416355727,
+          "ci95": 0.028607704124837516
+        },
+        "3": {
+          "n": 26,
+          "mean": 3.52067307692086,
+          "std": 0.1508700727335041,
+          "ci95": 0.0609513944793738
+        },
+        "4": {
+          "n": 17,
+          "mean": 3.458823529409349,
+          "std": 0.057071211321356174,
+          "ci95": 0.029344620047940216
+        },
+        "5": {
+          "n": 23,
+          "mean": 3.3027173913025614,
+          "std": 0.6108041983928942,
+          "ci95": 0.26414770854832187
+        },
+        "6": {
+          "n": 19,
+          "mean": 3.459868421050557,
+          "std": 0.10813916472416428,
+          "ci95": 0.05212334308005713
+        },
+        "7": {
+          "n": 24,
+          "mean": 3.49687499999707,
+          "std": 0.08932491375529837,
+          "ci95": 0.03772484598153949
+        },
+        "8": {
+          "n": 24,
+          "mean": 3.445312499997845,
+          "std": 0.05223438241722226,
+          "ci95": 0.022060295932988354
+        },
+        "9": {
+          "n": 28,
+          "mean": 3.4486607142829393,
+          "std": 0.06164595051044325,
+          "ci95": 0.023905778656976233
+        },
+        "10": {
+          "n": 27,
+          "mean": 3.441666666668127,
+          "std": 0.050239809531127735,
+          "ci95": 0.01987875643228228
+        },
+        "11": {
+          "n": 15,
+          "mean": 3.4425000000041615,
+          "std": 0.051495492177793985,
+          "ci95": 0.028520089256137107
+        },
+        "12": {
+          "n": 21,
+          "mean": 3.444642857145063,
+          "std": 0.052077380613893345,
+          "ci95": 0.02370575484004708
+        },
+        "13": {
+          "n": 22,
+          "mean": 3.571022727270527,
+          "std": 0.3305700875633804,
+          "ci95": 0.1465937813064391
+        },
+        "14": {
+          "n": 21,
+          "mean": 3.444642857139863,
+          "std": 0.052077380612068826,
+          "ci95": 0.023705754839216553
+        },
+        "15": {
+          "n": 15,
+          "mean": 3.4499999999978326,
+          "std": 0.05489437910259518,
+          "ci95": 0.030402517297258902
+        }
+      },
+      "peak_force_n_extracted": {
+        "n": 110,
+        "mean": 0.10400390625,
+        "std": 0.08835336115976718,
+        "ci95": 0.01651135840198874
+      },
+      "peak_force_n_immobile": {
+        "n": 183,
+        "mean": 0.28370341316598363,
+        "std": 0.07400773611933713,
+        "ci95": 0.01072278617990298
+      },
+      "tower_perturbation_mm": {
+        "n": 307,
+        "mean": 16.87983595738163,
+        "std": 89.12061418654233,
+        "ci95": 9.969308936557468
+      }
+    },
+    "ground_truth_open_loop": {
+      "trials": 18,
+      "attempts": 280,
+      "extracted": 69,
+      "immobile_classified": 116,
+      "errors": 95,
+      "tower_collapses": 17,
+      "successful_attempts": 185,
+      "extraction_rate": 0.24642857142857144,
+      "immobile_rate": 0.4142857142857143,
+      "error_rate": 0.3392857142857143,
+      "success_rate": 0.6607142857142857,
+      "failure_reasons": {
+        "tower_collapse": 17,
+        "wrong_block_contact": 72,
+        "push_incomplete": 6
+      },
+      "successful_attempts_per_trial": {
+        "n": 18,
+        "mean": 10.277777777777779,
+        "std": 8.280420247615707,
+        "ci95": 4.118116053408299
+      },
+      "max_successful_attempts": 31,
+      "extractions_per_trial": {
+        "n": 18,
+        "mean": 3.8333333333333335,
+        "std": 3.034119699837364,
+        "ci95": 1.508964118996307
+      },
+      "max_extractions": 11,
+      "immobile_per_trial": {
+        "n": 18,
+        "mean": 6.444444444444445,
+        "std": 6.4736772187085565,
+        "ci95": 3.219565345928388
+      },
+      "errors_per_trial": {
+        "n": 18,
+        "mean": 5.277777777777778,
+        "std": 6.0078924126377355,
+        "ci95": 2.9879157641494634
+      },
+      "longest_success_streak_per_trial": {
+        "n": 18,
+        "mean": 8.055555555555555,
+        "std": 8.199513774839996,
+        "ci95": 4.077878694144047
+      },
+      "alignment_error_mm": {
+        "n": 276,
+        "mean": 3.12127092108316,
+        "std": 2.526021991698673,
+        "ci95": 0.2980153661363774
+      },
+      "alignment_error_h_mm": {
+        "n": 276,
+        "mean": -0.3971662939325293,
+        "std": 1.591203644706238,
+        "ci95": 0.18772724003712277
+      },
+      "alignment_error_v_mm": {
+        "n": 276,
+        "mean": -0.30414822069903186,
+        "std": 3.657247557084544,
+        "ci95": 0.4314752497633589
+      },
+      "within_7mm_rate": 0.894927536231884,
+      "servo_time_s": {
+        "n": 0,
+        "mean": null,
+        "std": null,
+        "ci95": null
+      },
+      "servo_time_s_by_level": {},
+      "peak_force_n_extracted": {
+        "n": 82,
+        "mean": 0.12105802210365854,
+        "std": 0.09732277621681619,
+        "ci95": 0.02106510529094903
+      },
+      "peak_force_n_immobile": {
+        "n": 119,
+        "mean": 0.30388327205882354,
+        "std": 0.0673066693357658,
+        "ci95": 0.012093184833533978
+      },
+      "tower_perturbation_mm": {
+        "n": 280,
+        "mean": 22.881513610870456,
+        "std": 101.90130695491546,
+        "ci95": 11.935945025305916
+      }
+    },
+    "opencv_closed_loop": {
+      "trials": 18,
+      "attempts": 294,
+      "extracted": 100,
+      "immobile_classified": 175,
+      "errors": 19,
+      "tower_collapses": 12,
+      "successful_attempts": 275,
+      "extraction_rate": 0.3401360544217687,
+      "immobile_rate": 0.5952380952380952,
+      "error_rate": 0.06462585034013606,
+      "success_rate": 0.935374149659864,
+      "failure_reasons": {
+        "push_incomplete": 7,
+        "tower_collapse": 12
+      },
+      "successful_attempts_per_trial": {
+        "n": 18,
+        "mean": 15.277777777777779,
+        "std": 8.66232923135679,
+        "ci95": 4.308051524055197
+      },
+      "max_successful_attempts": 29,
+      "extractions_per_trial": {
+        "n": 18,
+        "mean": 5.555555555555555,
+        "std": 3.6977293863098053,
+        "ci95": 1.8389982985835454
+      },
+      "max_extractions": 13,
+      "immobile_per_trial": {
+        "n": 18,
+        "mean": 9.722222222222221,
+        "std": 6.359851603481063,
+        "ci95": 3.162956251300324
+      },
+      "errors_per_trial": {
+        "n": 18,
+        "mean": 1.0555555555555556,
+        "std": 0.8726040960806521,
+        "ci95": 0.43397373911961673
+      },
+      "longest_success_streak_per_trial": {
+        "n": 18,
+        "mean": 13.666666666666666,
+        "std": 8.429639584787227,
+        "ci95": 4.1923275703976595
+      },
+      "alignment_error_mm": {
+        "n": 292,
+        "mean": 0.9032270479255682,
+        "std": 0.3460595319780639,
+        "ci95": 0.039693140528451264
+      },
+      "alignment_error_h_mm": {
+        "n": 292,
+        "mean": 0.49187780188152924,
+        "std": 0.13050011668073533,
+        "ci95": 0.014968405698231314
+      },
+      "alignment_error_v_mm": {
+        "n": 292,
+        "mean": 0.17881554021545257,
+        "std": 0.8040456767910096,
+        "ci95": 0.0922242998415148
+      },
+      "within_7mm_rate": 1.0,
+      "servo_time_s": {
+        "n": 294,
+        "mean": 3.501318027209623,
+        "std": 0.21959488386228054,
+        "ci95": 0.025101786060788236
+      },
+      "servo_time_s_by_level": {
+        "2": {
+          "n": 20,
+          "mean": 3.547499999997825,
+          "std": 0.11309055523849505,
+          "ci95": 0.05292740079817014
+        },
+        "3": {
+          "n": 22,
+          "mean": 3.4357954545435274,
+          "std": 0.6725296003240044,
+          "ci95": 0.2982382885236146
+        },
+        "4": {
+          "n": 19,
+          "mean": 3.5664473684185203,
+          "std": 0.10745255991149992,
+          "ci95": 0.05179239787345961
+        },
+        "5": {
+          "n": 23,
+          "mean": 3.4711956521719496,
+          "std": 0.09515498591094723,
+          "ci95": 0.04115062003741618
+        },
+        "6": {
+          "n": 19,
+          "mean": 3.5131578947371893,
+          "std": 0.10536590379999707,
+          "ci95": 0.05078662450108902
+        },
+        "7": {
+          "n": 24,
+          "mean": 3.5062500000029373,
+          "std": 0.15441861511774,
+          "ci95": 0.06521605481711229
+        },
+        "8": {
+          "n": 25,
+          "mean": 3.5924999999977025,
+          "std": 0.2296396633855517,
+          "ci95": 0.09479525304555574
+        },
+        "9": {
+          "n": 27,
+          "mean": 3.47083333333155,
+          "std": 0.10521269666036313,
+          "ci95": 0.04163028462914657
+        },
+        "10": {
+          "n": 24,
+          "mean": 3.5015624999980566,
+          "std": 0.12839479812180563,
+          "ci95": 0.05422534184857992
+        },
+        "11": {
+          "n": 20,
+          "mean": 3.457499999997573,
+          "std": 0.06730234218174166,
+          "ci95": 0.031498103725784106
+        },
+        "12": {
+          "n": 21,
+          "mean": 3.51190476190694,
+          "std": 0.10907825390897062,
+          "ci95": 0.04965269595100608
+        },
+        "13": {
+          "n": 22,
+          "mean": 3.443181818179612,
+          "std": 0.07099707328838091,
+          "ci95": 0.03148418391920794
+        },
+        "14": {
+          "n": 15,
+          "mean": 3.517499999997404,
+          "std": 0.11618950038620043,
+          "ci95": 0.06434999999998776
+        },
+        "15": {
+          "n": 13,
+          "mean": 3.49038461538259,
+          "std": 0.08449510682249758,
+          "ci95": 0.05106426831844985
+        }
+      },
+      "peak_force_n_extracted": {
+        "n": 109,
+        "mean": 0.1132118155103211,
+        "std": 0.08768668727749829,
+        "ci95": 0.016461768331917575
+      },
+      "peak_force_n_immobile": {
+        "n": 176,
+        "mean": 0.28634504838423297,
+        "std": 0.0708061352903594,
+        "ci95": 0.010460937997318138
+      },
+      "tower_perturbation_mm": {
+        "n": 294,
+        "mean": 20.81024862651275,
+        "std": 101.59516747063465,
+        "ci95": 11.613294962997408
+      }
+    },
+    "opencv_open_loop": {
+      "trials": 18,
+      "attempts": 297,
+      "extracted": 61,
+      "immobile_classified": 135,
+      "errors": 101,
+      "tower_collapses": 16,
+      "successful_attempts": 196,
+      "extraction_rate": 0.2053872053872054,
+      "immobile_rate": 0.45454545454545453,
+      "error_rate": 0.3400673400673401,
+      "success_rate": 0.6599326599326599,
+      "failure_reasons": {
+        "tower_collapse": 16,
+        "wrong_block_contact": 72,
+        "push_incomplete": 13
+      },
+      "successful_attempts_per_trial": {
+        "n": 18,
+        "mean": 10.88888888888889,
+        "std": 8.137703743822469,
+        "ci95": 4.047138602049296
+      },
+      "max_successful_attempts": 27,
+      "extractions_per_trial": {
+        "n": 18,
+        "mean": 3.388888888888889,
+        "std": 2.9731917666113885,
+        "ci95": 1.4786627221570432
+      },
+      "max_extractions": 12,
+      "immobile_per_trial": {
+        "n": 18,
+        "mean": 7.5,
+        "std": 6.2426427284679775,
+        "ci95": 3.104664554096634
+      },
+      "errors_per_trial": {
+        "n": 18,
+        "mean": 5.611111111111111,
+        "std": 4.87658135907051,
+        "ci95": 2.4252788360980233
+      },
+      "longest_success_streak_per_trial": {
+        "n": 18,
+        "mean": 7.5,
+        "std": 6.801816366409265,
+        "ci95": 3.3827593688751225
+      },
+      "alignment_error_mm": {
+        "n": 296,
+        "mean": 4.515775668283927,
+        "std": 4.824349522199677,
+        "ci95": 0.5496028556219734
+      },
+      "alignment_error_h_mm": {
+        "n": 296,
+        "mean": 0.8405464719225488,
+        "std": 5.470336920648706,
+        "ci95": 0.6231954751553767
+      },
+      "alignment_error_v_mm": {
+        "n": 296,
+        "mean": -0.21333514922861782,
+        "std": 3.613383298757245,
+        "ci95": 0.4116463308297446
+      },
+      "within_7mm_rate": 0.8547297297297297,
+      "servo_time_s": {
+        "n": 0,
+        "mean": null,
+        "std": null,
+        "ci95": null
+      },
+      "servo_time_s_by_level": {},
+      "peak_force_n_extracted": {
+        "n": 71,
+        "mean": 0.10262502750880281,
+        "std": 0.08014182609344155,
+        "ci95": 0.01864172645532416
+      },
+      "peak_force_n_immobile": {
+        "n": 136,
+        "mean": 0.2995749080882353,
+        "std": 0.06817949970391143,
+        "ci95": 0.011458833980246011
+      },
+      "tower_perturbation_mm": {
+        "n": 297,
+        "mean": 16.15275665947165,
+        "std": 79.22465170595186,
+        "ci95": 9.01027788641407
+      }
+    }
+  }
+}
