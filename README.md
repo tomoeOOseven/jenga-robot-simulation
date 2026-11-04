@@ -100,6 +100,24 @@ Useful options: `--max-attempts`, `--seed`, `--block-mass-kg`,
 - `outcomes.png` (cf. paper Fig. 10), `force_profiles.png` (Fig. 6),
   `alignment_and_servo.png` (Figs. 8 and 9), and `trajectories.png`.
 
+### Write-up and slides
+
+- [docs/manuscript/closing-the-loop-on-jenga.pdf](docs/manuscript/closing-the-loop-on-jenga.pdf):
+  the method and the 18-trial results.
+- [docs/slides/closing-the-loop-on-jenga-slides.pdf](docs/slides/closing-the-loop-on-jenga-slides.pdf):
+  the slide deck.
+
+To rebuild them from `results/` (LaTeX via [Tectonic](https://tectonic-typesetting.github.io),
+e.g. `conda create -n latex -c conda-forge tectonic`):
+
+```powershell
+python docs\capture_scene.py            # simulator renders and example force traces
+python docs\make_figures.py             # figures for the document
+python docs\make_figures.py slides      # larger-text figures for the slides
+cd docs\manuscript; tectonic closing-the-loop-on-jenga.tex
+cd ..\slides; tectonic closing-the-loop-on-jenga-slides.tex
+```
+
 An attempt is **successful** if the block is extracted, or correctly found
 immobile, without collapsing the tower (paper section 4.5). The tower counts as
 collapsed when any other block falls: it drops, tilts more than 20°, or slides
