@@ -1245,6 +1245,7 @@ class JengaSimulation:
         controller: str = "closed_loop",
         seed: int = 0,
         gui: bool = False,
+        speed: float = 1.0,
     ):
         if detector not in DETECTORS:
             raise ValueError(f"detector must be one of {DETECTORS}")
@@ -1255,6 +1256,9 @@ class JengaSimulation:
         self.controller = controller
         self.seed = seed
         self.gui = gui
+        # GUI playback speed as a multiple of real time; 0 runs as fast as possible.
+        self.speed = speed
+        self._pace_origin: Optional[tuple[float, float]] = None
         if p.isConnected():
             raise RuntimeError("Only one JengaSimulation may be open per process")
         self.client_id = p.connect(p.GUI if gui else p.DIRECT)
@@ -1299,8 +1303,21 @@ class JengaSimulation:
             self.arm.pre_step()
             p.stepSimulation()
             self.sim_time += self.config.time_step
-            if self.gui:
-                time.sleep(self.config.time_step)
+            if self.gui and self.speed > 0:
+                self._pace()
+
+    def _pace(self) -> None:
+        """Keep the GUI at `speed` x real time, sleeping only when ahead."""
+        now = time.perf_counter()
+        if self._pace_origin is None:
+            self._pace_origin = (now, self.sim_time)
+        wall0, sim0 = self._pace_origin
+        delay = wall0 + (self.sim_time - sim0) / self.speed - now
+        if delay > 0:
+            time.sleep(delay)
+        elif delay < -0.25:
+            # Fell behind (e.g. while rendering camera images): do not race to catch up.
+            self._pace_origin = (now, self.sim_time)
 
     def _tool_target(self, center: np.ndarray, normal: np.ndarray, clearance: float) -> np.ndarray:
         return make_pose(face_frame(normal), center) @ tool_in_face(clearance)
@@ -1907,6 +1924,7 @@ def run_trial(job: dict[str, Any]) -> list[AttemptResult]:
         controller=job["controller"],
         seed=job["seed"],
         gui=job.get("gui", False),
+        speed=job.get("speed", 1.0),
     ) as simulation:
         results = simulation.run_game(job["trial"], job["max_attempts"])
     if job.get("verbose"):
@@ -1937,12 +1955,16 @@ def main() -> None:
                         default=math.degrees(SimulationConfig.joint_bias_std_rad),
                         help="Std of joint encoder offsets (robot calibration error).")
     parser.add_argument("--gui", action="store_true")
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="GUI playback speed as a multiple of real time; 0 = as fast as possible.")
     parser.add_argument("--output", default="results")
     args = parser.parse_args()
     if args.trials < 1:
         parser.error("--trials must be at least 1")
     if args.max_attempts < 1:
         parser.error("--max-attempts must be at least 1")
+    if args.speed < 0:
+        parser.error("--speed must be 0 or positive")
     try:
         config = SimulationConfig(
             block_mass_kg=args.block_mass_kg,
@@ -1958,7 +1980,8 @@ def main() -> None:
     )
     jobs = [
         {"config": asdict(config), "detector": d, "controller": c, "trial": t,
-         "seed": args.seed + t, "max_attempts": args.max_attempts, "gui": args.gui, "verbose": True}
+         "seed": args.seed + t, "max_attempts": args.max_attempts, "gui": args.gui,
+         "speed": args.speed, "verbose": True}
         for d, c in combinations for t in range(args.trials)
     ]
     started = time.time()
