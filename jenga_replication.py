@@ -1690,9 +1690,30 @@ class JengaSimulation:
         start = len(self.attempts)
         for _ in range(limit):
             attempt = self.run_attempt()
+            if attempt is not None and self.gui:
+                self._announce(attempt)
             if attempt is None or attempt.tower_collapsed:
                 break
         return self.attempts[start:]
+
+    def _announce(self, attempt: AttemptResult) -> None:
+        """For demos: print each attempt and show it as text in the GUI window."""
+        if attempt.tower_collapsed:
+            result = "TOWER COLLAPSED"
+        elif attempt.outcome == "error":
+            result = f"error ({attempt.failure_reason.replace('_', ' ')})"
+        else:
+            result = attempt.outcome
+        align = ("" if attempt.alignment_error_mm is None or not math.isfinite(attempt.alignment_error_mm)
+                 else f", finger {attempt.alignment_error_mm:.1f} mm off centre")
+        line = (f"Attempt {attempt.attempt + 1}: level {attempt.layer}, slot {attempt.slot} -> {result}"
+                f" (peak {attempt.peak_force_n:.2f} N{align})")
+        print(line, flush=True)
+        top = self.config.stand_height + self.config.layers * self.config.block_height
+        self._label = p.addUserDebugText(
+            line, [-0.25, 0.15, top + 0.08], textColorRGB=[0.05, 0.05, 0.05], textSize=1.3,
+            **({"replaceItemUniqueId": self._label} if getattr(self, "_label", None) is not None else {}),
+        )
 
     def close(self) -> None:
         if p.isConnected():
