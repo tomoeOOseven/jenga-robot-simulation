@@ -127,6 +127,36 @@ the push counts as extracted, since it has left the tower. Errors are
 unreachable poses, lost tracking, servo timeouts, and pushes that do not clear
 the block (for example, a side block that yaws off the finger).
 
+## Restacking (experimental, this branch only)
+
+`--restack` plays the full game: a mobile block is pushed out 32 mm, the tower
+turns half a turn on a turntable, the Panda gripper (with the push finger on
+the side of the hand) pulls the block out from behind and sets it on top.
+
+```powershell
+python .\jenga_replication.py --restack --trials 1 --output restack_results
+```
+
+Status: works for most single restacks (blocks land within about 5 mm), but
+roughly one restack in three or four still fails and usually ends the game
+after 2-3 restacks. Not evaluated.
+
+What it relies on:
+
+- **Grasp lock** (`grasp_lock`): once the jaws close, the block is fixed to
+  them. PyBullet's point contacts let a pinched block rotate about the pinch
+  line, which real pads resist. This is a simulation simplification.
+- **Compliant pull**: the gripper yields across the pull direction to the
+  force it feels (as the Panda can with its joint torque sensors), so it does
+  not lift and drag the tower above the block.
+- **Two blocks per new level**: the jaws are wider than the gap between two
+  blocks, so new levels get only their two outer blocks (`restack_slots`).
+- Placement aims at the top of the tower as measured at the overview, and the
+  block is lowered until contact is felt.
+
+Known failures: a placement on a two-block level sometimes slides off; a missed
+grasp can leave the jaws against the tower; long games are untested.
+
 ## Physical parameters and limitations
 
 - Blocks are 75 × 25 × 15 mm (presentation and paper). Mass is 19.6 g and

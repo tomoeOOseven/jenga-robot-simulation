@@ -27,7 +27,7 @@ import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any, Optional, Sequence
+from typing import Callable, Any, Optional, Sequence
 
 import cv2
 import matplotlib
@@ -74,6 +74,33 @@ class SimulationConfig:
     camera_up_offset: float = 0.08    # camera above the finger axis
     camera_back_offset: float = 0.15  # camera behind the fingertip
     joint_bias_std_rad: float = 0.003  # encoder offsets = kinematic calibration error
+    # "finger": the push finger replaces the hand (the evaluated setup).
+    # "combined": the Panda gripper is kept and the push finger is mounted on the
+    # side of the hand, pointing sideways; with the hand pointing down, the
+    # finger is horizontal for pushing and the jaws grasp from above.
+    end_effector: str = "finger"
+    gripper_force_n: float = 20.0      # per jaw (Panda hand limit)
+    turntable: bool = False            # stand rotates so the robot can reach the back faces
+    turntable_speed_rad_s: float = 0.3
+    # Restacking: push a mobile block until it protrudes this far from the back
+    # (under half its length, so it cannot tip out), then pull it from behind.
+    restack_push_distance: float = 0.032
+    grasp_tip_gap: float = 0.008       # jaw tips stop this far from the tower face
+    # The jaws (21 mm) are taller than a block (15 mm): grasping this far
+    # above the block's centre keeps their lower edges 1.5 mm above its bottom,
+    # so the block, not the jaws, touches the tower when it is set down.
+    grasp_height_offset: float = 0.0045
+    place_gap: float = 0.0             # extra space between restacked blocks in a level
+    # The jaws are wider than the gap between two blocks, so a block cannot be
+    # set down between two others: new levels get only their two outer blocks.
+    restack_slots: tuple[int, ...] = (0, 2)
+    # Simulation simplification: once the jaws have closed, fix the block to
+    # them. PyBullet's point contacts let a pinched block rotate about the
+    # pinch line, which real pads with a contact area resist.
+    grasp_lock: bool = True
+    # Full game: extracted blocks are pulled out from behind and stacked on
+    # top (needs end_effector="combined" and turntable=True).
+    restack: bool = False
 
     # Force sensor (1-D, on the fingertip; paper: 5 N full scale, 12 bit)
     sensor_stiffness_n_m: float = 100.0  # 0.32 N = 3.2 mm of tip travel
@@ -137,6 +164,12 @@ class SimulationConfig:
             raise ValueError("levels must satisfy 0 <= min_level <= max_level < layers - 1")
         if self.sensor_stiffness_n_m <= 0 or self.push_speed_m_s <= 0:
             raise ValueError("sensor stiffness and push speed must be positive")
+        if self.end_effector not in ("finger", "combined"):
+            raise ValueError("end_effector must be 'finger' or 'combined'")
+        if self.turntable_speed_rad_s <= 0 or self.gripper_force_n <= 0:
+            raise ValueError("turntable speed and gripper force must be positive")
+        if self.restack and not (self.end_effector == "combined" and self.turntable):
+            raise ValueError("restack needs end_effector='combined' and turntable=True")
 
     @property
     def tower_base_z(self) -> float:
@@ -198,6 +231,8 @@ class AttemptResult:
     tower_perturbation_mm: float
     tower_collapsed: bool
     sim_time_s: float
+    restack_stage: str = ""                 # restacking only: how the pull-and-place ended
+    place_error_mm: Optional[float] = None  # restacking only: placed block vs its slot
     trajectory: list[tuple[float, float, float]] = field(default_factory=list)
     force_profile: list[tuple[float, float]] = field(default_factory=list)
 
@@ -399,6 +434,9 @@ class BlockSelectionPolicy:
         self.current_subspace = self.rng.randrange(2)
         self.phase = 0
         self.current_level: Optional[int] = None
+        # Levels a block has been taken from (restacked blocks change level,
+        # so the level is remembered separately).
+        self.extracted_levels: set[int] = set()
 
     @property
     def force_threshold(self) -> float:
@@ -409,14 +447,32 @@ class BlockSelectionPolicy:
         )
 
     def _level_open(self, level: int) -> bool:
-        return not any(
+        return level not in self.extracted_levels and not any(
             b.layer == level and b.status == "extracted" for b in self.blocks
         )
+
+    def _top_complete_level(self) -> int:
+        counts: dict[int, int] = {}
+        for b in self.blocks:
+            if b.status != "extracted":
+                counts[b.layer] = counts.get(b.layer, 0) + 1
+        full = len(self.config.restack_slots) if self.config.restack else self.config.blocks_per_layer
+        return max(level for level, n in counts.items()
+                   if n >= (self.config.blocks_per_layer if level < self.config.layers else full))
+
+    def _levels(self, subspace: int) -> set[int]:
+        """The sub-space's levels. Levels added by restacking join the upper
+        sub-space once two complete levels lie above them, as for the
+        original top (max_level = top level - 2)."""
+        levels = set(self.subspaces[subspace])
+        if subspace == 1:
+            levels |= set(range(self.config.max_level + 1, self._top_complete_level() - 1))
+        return levels
 
     def candidates(
         self, subspace: int, visible: Optional[set[int]] = None
     ) -> list[Block]:
-        levels = self.subspaces[subspace]
+        levels = self._levels(subspace)
         return [
             b for b in self.blocks
             if b.layer in levels
@@ -443,20 +499,31 @@ class BlockSelectionPolicy:
         in_level.sort(key=lambda b: (b.slot != 1, self.rng.random()))
         return in_level[0]
 
-    def observe(self, block: Block, outcome: str, peak_force: float = 0.0) -> None:
+    def observe(self, block: Block, outcome: str, peak_force: float = 0.0,
+                level: Optional[int] = None) -> None:
+        """Update the memory after an attempt on `block`, which was in `level`
+        (its level before the attempt; a restacked block has moved)."""
+        level = block.layer if level is None else level
         block.attempts += 1
         block.peak_force = max(block.peak_force, peak_force)
         block.threshold = self.force_threshold
         if outcome == "extracted":
-            block.status = "extracted"
+            self.extracted_levels.add(level)
             self.current_level = None
+            if block.layer != level and block.status != "extracted":
+                # Restacked on top: a fresh, untested block of its new level.
+                block.status, block.attempts, block.peak_force = "present", 0, 0.0
+            else:
+                block.status = "extracted"
         elif outcome == "immobile":
             block.status = "tested"
             self.current_level = block.layer
         elif outcome == "error":
             # Paper: errors abort the attempt without updating the policy;
             # the attempt counter stops endless retries of an unreachable block.
-            if block.attempts >= self.config.max_attempts_per_block:
+            if block.status == "extracted":
+                self.extracted_levels.add(level)  # lost while restacking
+            elif block.attempts >= self.config.max_attempts_per_block:
                 block.status = "skipped"
         else:
             raise ValueError(f"Unknown attempt outcome: {outcome}")
@@ -506,15 +573,32 @@ class Tower:
         plane = p.loadURDF("plane.urdf")
         p.changeDynamics(plane, -1, lateralFriction=0.6)
         half = [0.10, 0.10, cfg.stand_height / 2]
-        self.stand_id = p.createMultiBody(
-            baseMass=0,
-            baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_BOX, halfExtents=half),
-            baseVisualShapeIndex=p.createVisualShape(
-                p.GEOM_BOX, halfExtents=half, rgbaColor=[0.22, 0.23, 0.26, 1]
-            ),
-            basePosition=[cfg.tower_origin[0], cfg.tower_origin[1], cfg.stand_height / 2],
-        )
-        p.changeDynamics(self.stand_id, -1, lateralFriction=0.5)
+        collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=half)
+        visual = p.createVisualShape(p.GEOM_BOX, halfExtents=half, rgbaColor=[0.22, 0.23, 0.26, 1])
+        centre = [cfg.tower_origin[0], cfg.tower_origin[1], cfg.stand_height / 2]
+        if cfg.turntable:
+            # A fixed, shapeless base with the stand on a vertical revolute joint.
+            self.stand_id = p.createMultiBody(
+                baseMass=0, basePosition=centre,
+                linkMasses=[5.0], linkCollisionShapeIndices=[collision],
+                linkVisualShapeIndices=[visual], linkPositions=[[0, 0, 0]],
+                linkOrientations=[[0, 0, 0, 1]], linkInertialFramePositions=[[0, 0, 0]],
+                linkInertialFrameOrientations=[[0, 0, 0, 1]], linkParentIndices=[0],
+                linkJointTypes=[p.JOINT_REVOLUTE], linkJointAxis=[[0, 0, 1]],
+            )
+            p.changeDynamics(self.stand_id, 0, lateralFriction=0.5)
+            # A motorised link otherwise keeps the whole tower awake, and
+            # awake stacked boxes creep (about 0.1 mm/s).
+            for link in (-1, 0):
+                p.changeDynamics(self.stand_id, link, sleepThreshold=0.005,
+                                 activationState=p.ACTIVATION_STATE_ENABLE_SLEEPING)
+            self._hold_table(0.0)
+        else:
+            self.stand_id = p.createMultiBody(
+                baseMass=0, baseCollisionShapeIndex=collision, baseVisualShapeIndex=visual,
+                basePosition=centre,
+            )
+            p.changeDynamics(self.stand_id, -1, lateralFriction=0.5)
         sigma = cfg.block_height_tolerance_m
         z = cfg.tower_base_z
         pitch = cfg.block_width + cfg.block_gap_m
@@ -564,22 +648,65 @@ class Tower:
                 self.blocks.append(Block(len(self.blocks), layer, slot, long_axis, body))
             z += float(np.max(heights))
 
+    # ----- turntable -----------------------------------------------------
+    TABLE_TORQUE = 200.0
+
+    def _hold_table(self, angle: float) -> None:
+        p.setJointMotorControl2(self.stand_id, 0, p.POSITION_CONTROL, targetPosition=angle,
+                                force=self.TABLE_TORQUE, positionGain=0.3, velocityGain=1.0)
+
+    def table_angle(self) -> float:
+        return float(p.getJointState(self.stand_id, 0)[0]) if self.config.turntable else 0.0
+
+    def rotate_table(self, angle: float, step: Callable[[int], None]) -> None:
+        """Turn the stand to `angle` (rad) along a trapezoidal profile, then let it settle."""
+        if not self.config.turntable:
+            raise RuntimeError("The stand is not a turntable (turntable=False)")
+        for link in (-1, 0):  # a sleeping body ignores its motor
+            p.changeDynamics(self.stand_id, link, activationState=p.ACTIVATION_STATE_WAKE_UP)
+        start = self.table_angle()
+        duration = 1.5 * abs(angle - start) / self.config.turntable_speed_rad_s
+        steps = max(2, int(duration / self.config.time_step))
+        for fraction in trapezoid_profile(steps):
+            self._hold_table(start + (angle - start) * float(fraction))
+            step(1)
+        self._hold_table(angle)
+        # Turning wakes every block; give them time to come to rest (Bullet
+        # puts bodies to sleep after about 2 s), or they creep afterwards.
+        step(int(2.5 / self.config.time_step))
+
     def settle(self, steps: int = 720) -> None:
         for _ in range(steps):
             p.stepSimulation()
         for block in self.blocks:
-            self.initial_poses[block.block_id] = self.pose(block)
+            self.initial_poses[block.block_id] = self.table_pose(block)
 
     def pose(self, block: Block) -> tuple[np.ndarray, np.ndarray]:
         position, orientation = p.getBasePositionAndOrientation(block.body_id)
         return np.asarray(position), matrix_from_quat(orientation)
 
+    def table_pose(self, block: Block) -> tuple[np.ndarray, np.ndarray]:
+        """Block pose in the turntable frame (equal to the world pose at angle 0).
+
+        Baselines and collapse checks use this frame so turning the tower is
+        not mistaken for blocks moving.
+        """
+        position, rotation = self.pose(block)
+        angle = self.table_angle()
+        if angle == 0.0:
+            return position, rotation
+        c, s_ = math.cos(-angle), math.sin(-angle)
+        yaw = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
+        origin = np.array([self.config.tower_origin[0], self.config.tower_origin[1], 0.0])
+        return origin + yaw @ (position - origin), yaw @ rotation
+
     def face(self, block: Block) -> tuple[np.ndarray, np.ndarray]:
         """True centre and outward normal of the block's push face."""
         position, rotation = self.pose(block)
+        # The end facing the robot's side of the tower (+x or -y); at table
+        # angle 0 that is the +x end of x blocks and the -y end of y blocks.
         long_axis = rotation[:, 0]
-        outward = np.array([1.0, 0.0, 0.0]) if block.long_axis == "x" else np.array([0.0, -1.0, 0.0])
-        if np.dot(long_axis, outward) < 0:
+        if float(np.dot(long_axis, TowerMap.ROBOT_SIDE)) < 0:
             long_axis = -long_axis
         return position + long_axis * self.config.block_length / 2, long_axis
 
@@ -594,13 +721,13 @@ class Tower:
 
     def snapshot(self) -> dict[int, np.ndarray]:
         return {
-            b.block_id: self.pose(b)[0]
+            b.block_id: self.table_pose(b)[0]
             for b in self.blocks if b.status != "extracted"
         }
 
     def has_fallen(self, block: Block) -> bool:
         """True if the block dropped or tipped over since its baseline pose."""
-        position, rotation = self.pose(block)
+        position, rotation = self.table_pose(block)
         start, start_rotation = self.initial_poses[block.block_id]
         if start[2] - position[2] > self.config.block_height * 0.5:
             return True
@@ -616,7 +743,7 @@ class Tower:
         for block in self.blocks:
             if block.status == "extracted" or block.block_id == exclude:
                 continue
-            position, _ = self.pose(block)
+            position, _ = self.table_pose(block)
             start, _ = self.initial_poses[block.block_id]
             if np.linalg.norm(position[:2] - start[:2]) > cfg.block_length * 0.5:
                 return True
@@ -626,49 +753,93 @@ class Tower:
 
 
 class TowerMap:
-    """The robot's model of the tower: a nominal grid registered from vision."""
+    """The robot's model of the tower: a nominal grid registered from vision.
+
+    The grid lives in the turntable frame: `angle` is the table angle the
+    robot commanded (its encoder), and `origin` is the tower centre in that
+    frame. At angle 0 the table and world frames coincide. Each block has one
+    end facing the robot, the end whose outward normal points to the robot's
+    side of the tower (+x or -y).
+    """
+
+    ROBOT_SIDE = np.array([1.0, -1.0, 0.0]) / math.sqrt(2.0)
 
     def __init__(self, config: SimulationConfig):
         self.config = config
         self.origin = np.array([config.tower_origin[0], config.tower_origin[1], config.tower_base_z])
+        self.angle = 0.0
+        self.max_layers = config.layers + 16  # restacking adds levels
 
-    def nominal_face(self, layer: int, slot: int) -> tuple[np.ndarray, np.ndarray]:
+    # ----- frames ------------------------------------------------------------
+    def _yaw(self, angle: float) -> np.ndarray:
+        c, s_ = math.cos(angle), math.sin(angle)
+        return np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
+
+    def to_table(self, point: np.ndarray) -> np.ndarray:
+        axis = np.array([self.config.tower_origin[0], self.config.tower_origin[1], 0.0])
+        return axis + self._yaw(-self.angle) @ (np.asarray(point) - axis)
+
+    def to_world(self, point: np.ndarray) -> np.ndarray:
+        axis = np.array([self.config.tower_origin[0], self.config.tower_origin[1], 0.0])
+        return axis + self._yaw(self.angle) @ (np.asarray(point) - axis)
+
+    def vector_to_table(self, vector: np.ndarray) -> np.ndarray:
+        return self._yaw(-self.angle) @ np.asarray(vector)
+
+    def vector_to_world(self, vector: np.ndarray) -> np.ndarray:
+        return self._yaw(self.angle) @ np.asarray(vector)
+
+    # ----- grid ----------------------------------------------------------------
+    def _table_face(self, layer: int, slot: int) -> tuple[np.ndarray, np.ndarray]:
+        """Robot-facing face centre and outward normal, in the table frame."""
         cfg = self.config
         pitch = cfg.block_width + cfg.block_gap_m
         offset = (slot - (cfg.blocks_per_layer - 1) / 2) * pitch
         z = self.origin[2] + cfg.block_height * (layer + 0.5)
-        if layer % 2 == 0:
-            normal = np.array([1.0, 0.0, 0.0])
-            center = np.array([self.origin[0] + cfg.block_length / 2, self.origin[1] + offset, z])
-        else:
-            normal = np.array([0.0, -1.0, 0.0])
-            center = np.array([self.origin[0] + offset, self.origin[1] - cfg.block_length / 2, z])
-        return center, normal
+        axis = np.array([1.0, 0.0, 0.0]) if layer % 2 == 0 else np.array([0.0, 1.0, 0.0])
+        across = np.array([0.0, 1.0, 0.0]) if layer % 2 == 0 else np.array([1.0, 0.0, 0.0])
+        if float(np.dot(self.vector_to_world(axis), self.ROBOT_SIDE)) < 0:
+            axis = -axis
+        center = np.array([self.origin[0], self.origin[1], z]) + axis * cfg.block_length / 2 + across * offset
+        return center, axis
+
+    def nominal_face(self, layer: int, slot: int) -> tuple[np.ndarray, np.ndarray]:
+        """Robot-facing face centre and outward normal, in the world frame."""
+        center, normal = self._table_face(layer, slot)
+        return self.to_world(center), self.vector_to_world(normal)
+
+    @staticmethod
+    def _parity(normal_table: np.ndarray) -> Optional[int]:
+        if abs(normal_table[0]) > 0.85:
+            return 0
+        if abs(normal_table[1]) > 0.85:
+            return 1
+        return None
 
     def associate(
         self, center: np.ndarray, normal: np.ndarray, tolerance: float = 0.010
     ) -> Optional[tuple[int, int]]:
         cfg = self.config
-        if normal[0] > 0.85:
-            parity = 0
-        elif normal[1] < -0.85:
-            parity = 1
-        else:
+        c = self.to_table(center)
+        parity = self._parity(self.vector_to_table(normal))
+        if parity is None:
             return None
-        layer = int(round((center[2] - self.origin[2]) / cfg.block_height - 0.5))
-        if layer % 2 != parity or not 0 <= layer < cfg.layers:
+        layer = int(round((c[2] - self.origin[2]) / cfg.block_height - 0.5))
+        if layer % 2 != parity or not 0 <= layer < self.max_layers:
             return None
         pitch = cfg.block_width + cfg.block_gap_m
-        lateral = center[1] - self.origin[1] if parity == 0 else center[0] - self.origin[0]
+        lateral = c[1] - self.origin[1] if parity == 0 else c[0] - self.origin[0]
         slot = int(round(lateral / pitch + (cfg.blocks_per_layer - 1) / 2))
         if not 0 <= slot < cfg.blocks_per_layer:
             return None
-        nominal, nominal_normal = self.nominal_face(layer, slot)
-        residual = center - nominal
+        nominal, nominal_normal = self._table_face(layer, slot)
+        residual = c - nominal
         depth = float(np.dot(residual, nominal_normal))
         # Faces are told apart in-plane; depth varies with per-block jitter,
-        # half-pushed blocks and depth-sensor bias, so it is gated loosely.
-        if np.linalg.norm(residual - depth * nominal_normal) > tolerance or abs(depth) > 0.03:
+        # half-pushed blocks (up to the restacking push distance) and
+        # depth-sensor bias, so it is gated loosely.
+        depth_gate = 0.045 if cfg.restack else 0.03
+        if np.linalg.norm(residual - depth * nominal_normal) > tolerance or abs(depth) > depth_gate:
             return None
         return layer, slot
 
@@ -687,16 +858,15 @@ class TowerMap:
         for obs in observations:
             if obs.world_center is None or obs.world_normal is None:
                 continue
-            if obs.world_normal[0] > 0.85:
-                parity, lateral_axis = 0, 1
-            elif obs.world_normal[1] < -0.85:
-                parity, lateral_axis = 1, 0
-            else:
+            parity = self._parity(self.vector_to_table(obs.world_normal))
+            if parity is None:
                 continue
-            height = obs.world_center[2] - self.origin[2] - cfg.block_height * (parity + 0.5)
+            lateral_axis = 1 if parity == 0 else 0
+            c = self.to_table(obs.world_center)
+            height = c[2] - self.origin[2] - cfg.block_height * (parity + 0.5)
             period = 2 * cfg.block_height
             offsets[2].append(height - period * round(height / period))
-            lateral = obs.world_center[lateral_axis] - self.origin[lateral_axis]
+            lateral = c[lateral_axis] - self.origin[lateral_axis]
             offsets[lateral_axis].append(lateral - pitch * round(lateral / pitch))
         for axis, values in enumerate(offsets):
             if len(values) >= 3:
@@ -705,9 +875,9 @@ class TowerMap:
     def register(self, observations: Sequence[FaceObservation]) -> None:
         """Refine the tower origin from the in-plane residuals of associated faces.
 
-        Each face only measures the origin across its own plane: x-facing
-        faces give y and z, y-facing faces give x and z. Depth is ignored
-        because it depends on per-block jitter.
+        Each face only measures the origin across its own plane (table
+        frame): x-facing faces give y and z, y-facing faces give x and z.
+        Depth is ignored because it depends on per-block jitter.
         """
         self._coarse_align(observations)
         for _ in range(2):
@@ -718,8 +888,8 @@ class TowerMap:
                 key = self.associate(obs.world_center, obs.world_normal, tolerance=0.015)
                 if key is None:
                     continue
-                nominal, normal = self.nominal_face(*key)
-                residual = obs.world_center - nominal
+                nominal, normal = self._table_face(*key)
+                residual = self.to_table(obs.world_center) - nominal
                 for axis in range(3):
                     if abs(normal[axis]) < 0.5:
                         per_axis[axis].append(float(residual[axis]))
@@ -750,11 +920,21 @@ def camera_in_tool(config: SimulationConfig) -> np.ndarray:
     return make_pose(rotation, (-config.camera_up_offset, 0.0, -config.camera_back_offset))
 
 
+HAND_HALF_DEPTH = 0.0316  # Panda hand collision mesh, half its extent along hand x
+
+
 def build_robot_urdf(config: SimulationConfig, directory: str) -> str:
     source_dir = os.path.join(pybullet_data.getDataPath(), "franka_panda")
     with open(os.path.join(source_dir, "panda.urdf"), encoding="utf-8") as stream:
         text = stream.read()
-    head = text[: text.index('<joint name="panda_hand_joint"')]
+    if config.end_effector == "combined":
+        # Keep the hand and its jaws; the finger leaves the side of the hand
+        # (hand -x face, mid-height) at right angles to the jaws.
+        head = text[: text.rindex("</robot>")]
+        parent, mount_xyz, mount_rpy = "panda_hand", f"{-HAND_HALF_DEPTH} 0 0.03", f"0 {-math.pi / 2} 0"
+    else:
+        head = text[: text.index('<joint name="panda_hand_joint"')]
+        parent, mount_xyz, mount_rpy = "panda_link8", "0 0 0", "0 0 0"
     head = head.replace("package://meshes/", source_dir.replace("\\", "/") + "/meshes/")
     rod = config.finger_length - config.fingertip_length
     w, h, tip = config.probe_width, config.probe_height, config.fingertip_length
@@ -772,7 +952,7 @@ def build_robot_urdf(config: SimulationConfig, directory: str) -> str:
       <material name="camera"><color rgba="0.08 0.08 0.1 1"/></material></visual>
   </link>
   <joint name="finger_mount_joint" type="fixed">
-    <parent link="panda_link8"/><child link="finger_mount"/><origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="{parent}"/><child link="finger_mount"/><origin xyz="{mount_xyz}" rpy="{mount_rpy}"/>
   </joint>
   <link name="fingertip">
     <inertial><origin xyz="0 0 {tip / 2}"/><mass value="{config.fingertip_mass_kg}"/>{_box_inertia(config.fingertip_mass_kg, (h, w, tip))}</inertial>
@@ -796,7 +976,7 @@ def build_robot_urdf(config: SimulationConfig, directory: str) -> str:
   </joint>
 </robot>
 """
-    path = os.path.join(directory, "panda_jenga_finger.urdf")
+    path = os.path.join(directory, f"panda_jenga_{config.end_effector}.urdf")
     with open(path, "w", encoding="utf-8") as stream:
         stream.write(head + tail)
     return path
@@ -833,6 +1013,10 @@ class PandaArm:
         }
         self.arm_joints = list(range(7))
         self.tool_link = links["tool_frame"]
+        self.finger_tool_link = self.tool_link
+        # Combined end effector: the grasp point between the jaws, and the jaws.
+        self.grip_link = links.get("panda_grasptarget")
+        self.jaw_joints = [links[name] for name in ("panda_leftfinger", "panda_rightfinger") if name in links]
         self.camera_link = links["camera_link"]
         self.tip_link = links["fingertip"]
         self.sensor_joint = links["fingertip"]  # joint index == child link index
@@ -861,6 +1045,40 @@ class PandaArm:
         for joint, value in zip(self.arm_joints, self.READY):
             p.resetJointState(self.robot_id, joint, value - self.bias[joint])
         self.command_positions(np.asarray(self.READY))
+        if self.jaw_joints:
+            for joint in self.jaw_joints:
+                p.resetJointState(self.robot_id, joint, self.GRIPPER_OPEN / 2)
+                # The stock Panda model gives the jaws soft contacts (30 kN/m);
+                # at 20 N the block can rock about the pinch line on that
+                # cushion. Stiffer pads hold its tilt.
+                p.changeDynamics(self.robot_id, joint, lateralFriction=1.0, frictionAnchor=1,
+                                 contactStiffness=1.0e6, contactDamping=300.0)
+            self.set_gripper(self.GRIPPER_OPEN)
+
+    # ----- tools (combined end effector) -----------------------------------
+    GRIPPER_OPEN = 0.06  # jaw opening (m); blocks are 25 mm wide
+
+    def use_tool(self, tool: str) -> None:
+        """Make the push finger or the gripper the tool that IK and servoing control."""
+        if tool == "finger":
+            self.tool_link = self.finger_tool_link
+        elif tool == "gripper":
+            if self.grip_link is None:
+                raise RuntimeError("This robot has no gripper (end_effector='finger')")
+            self.tool_link = self.grip_link
+        else:
+            raise ValueError("tool must be 'finger' or 'gripper'")
+
+    def set_gripper(self, width: float) -> None:
+        """Command the jaw opening; closing on a block stops at the force limit."""
+        for joint in self.jaw_joints:
+            p.setJointMotorControl2(
+                self.robot_id, joint, p.POSITION_CONTROL, targetPosition=max(0.0, width / 2),
+                force=self.config.gripper_force_n, maxVelocity=0.05,
+            )
+
+    def gripper_width(self) -> float:
+        return float(sum(p.getJointState(self.robot_id, j)[0] for j in self.jaw_joints))
 
     # ----- true robot -------------------------------------------------------
     def q_true(self) -> np.ndarray:
@@ -934,7 +1152,8 @@ class PandaArm:
     def jacobian(self, q: Optional[Sequence[float]] = None) -> np.ndarray:
         return self.pose_and_jacobian(q)[1]
 
-    def ik(self, target: np.ndarray, attempts: int = 12) -> Optional[np.ndarray]:
+    def ik(self, target: np.ndarray, attempts: int = 12,
+           valid: Optional[Callable[[np.ndarray], bool]] = None) -> Optional[np.ndarray]:
         """Damped least-squares IK on the controller's model, within joint limits.
 
         Several seeds are tried; the valid solution closest to the current
@@ -981,7 +1200,7 @@ class PandaArm:
             pose = self.tool_pose(q)
             position_error = float(np.linalg.norm(pose[:3, 3] - target[:3, 3]))
             angle_error = float(np.linalg.norm(rotation_vector(target[:3, :3] @ pose[:3, :3].T)))
-            if position_error < 2e-4 and angle_error < 2e-3:
+            if position_error < 2e-4 and angle_error < 2e-3 and (valid is None or valid(q)):
                 cost = float(np.linalg.norm(q - current))
                 if best is None or cost < best[0]:
                     best = (cost, q)
@@ -1319,6 +1538,11 @@ class JengaSimulation:
             # Fell behind (e.g. while rendering camera images): do not race to catch up.
             self._pace_origin = (now, self.sim_time)
 
+    def rotate_tower(self, angle: float) -> None:
+        """Turn the turntable to `angle` (rad, 0 = initial orientation)."""
+        self.tower.rotate_table(angle, self.step)
+        self.map.angle = self.tower.table_angle()
+
     def _tool_target(self, center: np.ndarray, normal: np.ndarray, clearance: float) -> np.ndarray:
         return make_pose(face_frame(normal), center) @ tool_in_face(clearance)
 
@@ -1423,12 +1647,35 @@ class JengaSimulation:
         self._move_joints(self._overview_q, trajectory)
         self._hold(0.2)
         observations = self._detect()
+        self.map.angle = self.tower.table_angle()
         if self.detector_mode == "opencv":
             self.map.register(observations)
+            # The robot's own record of which block sits in which slot
+            # (restacking moves blocks to new levels).
+            slots = {(b.layer, b.slot): b.block_id for b in self.tower.blocks if b.status != "extracted"}
             for obs in observations:
                 key = self.map.associate(obs.world_center, obs.world_normal)
-                obs.block_id = None if key is None else key[0] * self.config.blocks_per_layer + key[1]
+                obs.block_id = None if key is None else slots.get(key)
+        if self.config.restack:
+            self._register_top(observations)
         return {obs.block_id: obs for obs in observations if obs.block_id is not None}
+
+    def _register_top(self, observations: Sequence[FaceObservation]) -> None:
+        """Locate the top of the tower, where restacked blocks are placed.
+
+        Earlier pulls drag the upper levels by a few millimetres, so the map is
+        registered again from the faces of the top four levels only.
+        """
+        top_level = max(b.layer for b in self.tower.blocks if b.status != "extracted")
+        local = TowerMap(self.config)
+        local.origin, local.angle = self.map.origin.copy(), self.map.angle
+        near = []
+        for obs in observations:
+            key = self.map.associate(obs.world_center, obs.world_normal, tolerance=0.015)
+            if key is not None and key[0] >= top_level - 3:
+                near.append(obs)
+        local.register(near)
+        self.top_origin = local.origin.copy()
 
     # ----- stage 4: alignment -------------------------------------------------
     def _desired_face_in_camera(self) -> np.ndarray:
@@ -1450,6 +1697,7 @@ class JengaSimulation:
             observations = self._detect()
             local_map = TowerMap(self.config)
             local_map.origin = self.map.origin.copy()
+            local_map.angle = self.map.angle
             local_map.register(observations)
             for obs in observations:
                 if local_map.associate(obs.world_center, obs.world_normal) == (block.layer, block.slot):
@@ -1538,7 +1786,10 @@ class JengaSimulation:
         return math.hypot(horizontal, vertical), horizontal, vertical
 
     # ----- push primitive -----------------------------------------------------
-    def _push(self, block: Block, threshold: float, trajectory: list) -> tuple[str, str, float, list, float]:
+    def _push(self, block: Block, threshold: float, trajectory: list,
+              stop_at: Optional[float] = None) -> tuple[str, str, float, list, float]:
+        """Push along the finger. With `stop_at`, a mobile block is pushed only
+        that far (outcome "partial") so the gripper can pull it from behind."""
         cfg = self.config
         tool = self.arm.tool_pose()
         travel = cfg.probe_clearance + cfg.block_length + cfg.push_overtravel
@@ -1553,6 +1804,8 @@ class JengaSimulation:
         def monitor(index: int) -> Optional[str]:
             position, _ = self.tower.pose(block)
             state["displacement"] = float(np.dot(position - start_center, push_axis))
+            if stop_at is not None and state["displacement"] >= stop_at:
+                return "partial"
             if state["displacement"] >= cfg.block_length + 0.001:
                 return "extracted"
             if index % self.sensor_steps == 0:
@@ -1571,6 +1824,8 @@ class JengaSimulation:
             return None
 
         reason = self._move_linear(goal, cfg.push_speed_m_s, trajectory, monitor)
+        if reason == "partial":
+            return "partial", "", state["peak"], profile, state["displacement"]
         if reason == "extracted":
             self.tower.remove(block)
             return "extracted", "", state["peak"], profile, state["displacement"]
@@ -1590,6 +1845,335 @@ class JengaSimulation:
             return "error", "push_jammed", state["peak"], profile, state["displacement"]
         return "error", "push_incomplete", state["peak"], profile, state["displacement"]
 
+    # ----- restacking (combined end effector + turntable) -------------------
+    JAW_TIP_BEYOND_GRASP = 0.007  # jaw tips extend this far past the grasp point
+
+    def _rotate_xy(self, point: np.ndarray, angle: float) -> np.ndarray:
+        """Rotate a world point about the tower's vertical axis."""
+        origin = np.array([self.config.tower_origin[0], self.config.tower_origin[1], 0.0])
+        c, s_ = math.cos(angle), math.sin(angle)
+        rotation = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
+        return origin + rotation @ (np.asarray(point) - origin)
+
+    def _slide_in(self, block: Block, face_center: np.ndarray, normal: np.ndarray,
+                  distance: float, trajectory: list) -> str:
+        """Push a freshly placed top block `distance` along its axis into its slot.
+
+        The face is found like any push target (servoing in closed loop);
+        the force threshold is only the safety limit, since a top block is
+        free to slide.
+        """
+        cfg = self.config
+        q = self.arm.ik(self._tool_target(face_center, normal, cfg.staging_distance),
+                        valid=lambda q_: self._arm_clear_of_tower(q_))
+        if q is None:
+            return "ik_failure"
+        self._move_joints(q, trajectory)
+        self._move_linear(self._tool_target(face_center, normal, cfg.approach_distance),
+                          cfg.approach_speed_m_s, trajectory)
+        servo = ""
+        if self.controller == "closed_loop":
+            servo, _, _ = self._servo(block, face_center, trajectory)
+        if self.controller != "closed_loop" or servo:
+            # Open loop, or the camera lost the new block: the gripper has
+            # just put it there, so its position is known to a few mm.
+            self._move_linear(self._tool_target(face_center, normal, cfg.probe_clearance),
+                              cfg.approach_speed_m_s / 2, trajectory)
+        outcome, reason, _, _, moved = self._push(block, cfg.push_safety_force, trajectory, stop_at=distance)
+        back = self.arm.tool_pose()
+        self._move_linear(make_pose(back[:3, :3], back[:3, 3] - back[:3, 2] * (cfg.approach_distance + max(moved, 0.0))),
+                          cfg.approach_speed_m_s, trajectory)
+        return "ok" if outcome == "partial" else (reason or outcome)
+
+    def _held_force(self, block: Block) -> np.ndarray:
+        """Force the held block exerts on the gripper (world frame, N).
+
+        Jaw contact forces plus the grasp lock's force. Stands in for the
+        Panda's external-force estimate from its joint torque sensors.
+        """
+        force = np.zeros(3)
+        for c in p.getContactPoints(bodyA=self.arm.robot_id, bodyB=block.body_id):
+            force += c[9] * np.asarray(c[7]) + c[10] * np.asarray(c[11]) + c[12] * np.asarray(c[13])
+        if getattr(self, "_grasp_constraint", None) is not None:
+            force += np.asarray(p.getConstraintState(self._grasp_constraint)[:3])
+        return force
+
+    def _pull_out(self, block: Block, goal: np.ndarray, speed: float, trajectory: list) -> None:
+        """Straight pull, compliant across the pull direction.
+
+        The gripper fixes the block's height and sideways position, while the
+        levels above and below fix them inside the tower. With calibration
+        error the two disagree by fractions of a millimetre: the block then
+        lifts the tower above it and the pull drags that whole section along.
+        So the gripper yields across the pull until it carries only the
+        block's weight. It keeps the block's tilt fixed, because the slot is
+        level and yielding in tilt lets the block pry the level above.
+        """
+        cfg = self.config
+        weight = np.array([0.0, 0.0, cfg.block_mass_kg * 9.81])
+        gain = 0.01  # m/s per N of load across the pull direction
+        start = self.arm.tool_pose()
+        self.arm.posture = self.arm.q_meas()
+        path = goal[:3, 3] - start[:3, 3]
+        distance = float(np.linalg.norm(path))
+        direction = path / max(distance, 1e-9)
+        across = np.eye(3) - np.outer(direction, direction)
+        settle = int(0.8 / cfg.time_step)
+        steps = max(2, int(distance / speed / cfg.time_step))
+        profile = trapezoid_profile(steps, 0.1)
+        rate = np.gradient(profile) / cfg.time_step * distance
+        shift = np.zeros(3)
+        for index in range(settle + steps + settle):
+            k = min(max(index - settle, 0), steps - 1)
+            s = profile[k] if index >= settle else 0.0
+            ds = rate[k] if settle <= index < settle + steps else 0.0
+            excess = across @ (self._held_force(block) + weight)
+            shift += gain * np.clip(excess, -3.0, 3.0) * cfg.time_step
+            pose = self.arm.tool_pose()
+            reference = start[:3, 3] + direction * distance * s + shift
+            linear = direction * ds + 5.0 * (reference - pose[:3, 3])
+            angular = 4.0 * rotation_vector(goal[:3, :3] @ pose[:3, :3].T)
+            self.arm.command_velocities(self.arm.twist_to_joint_velocity(np.concatenate((linear, angular))))
+            self.step()
+            if index % 12 == 0:
+                trajectory.append(tuple(self.arm.true_link_pose(self.arm.tool_link)[:3, 3]))
+        self.arm.command_positions(self.arm.q_meas())
+
+    def _lock_grasp(self, block: Block) -> None:
+        """Fix the block to the gripper where the jaws hold it (`grasp_lock`)."""
+        self._grasp_constraint = None
+        if not self.config.grasp_lock:
+            return
+        grip = self.arm.true_link_pose(self.arm.grip_link)
+        position, orientation = p.getBasePositionAndOrientation(block.body_id)
+        relative = invert_pose(grip) @ make_pose(matrix_from_quat(orientation), position)
+        self._grasp_constraint = p.createConstraint(
+            self.arm.robot_id, self.arm.grip_link, block.body_id, -1, p.JOINT_FIXED, [0, 0, 0],
+            parentFramePosition=relative[:3, 3].tolist(),
+            childFramePosition=[0, 0, 0],
+            parentFrameOrientation=quat_from_matrix(relative[:3, :3]),
+        )
+        p.changeConstraint(self._grasp_constraint, maxForce=50.0)
+
+    def _unlock_grasp(self) -> None:
+        if getattr(self, "_grasp_constraint", None) is not None:
+            p.removeConstraint(self._grasp_constraint)
+            self._grasp_constraint = None
+
+    def _arm_clear_of_tower(self, q: np.ndarray, exclude: Optional[Block] = None,
+                            margin: float = 0.02) -> bool:
+        """True if no arm link (base to flange) of the model at `q` overlaps the tower.
+
+        Uses axis-aligned bounding boxes, so it is conservative. The hand,
+        jaws, finger and camera are left out: they are meant to come close.
+        """
+        boxes = [p.getAABB(b.body_id) for b in self.tower.blocks
+                 if b.status != "extracted" and b is not exclude]
+        low = np.min([b[0] for b in boxes], axis=0) - margin
+        high = np.max([b[1] for b in boxes], axis=0) + margin
+        self.arm._set_model(q)
+        for link in range(self.arm.arm_joints[-1] + 2):  # links 0-7 (flange)
+            a, b = p.getAABB(self.arm.model_id, link)
+            a = np.asarray(a) - self.arm.MODEL_OFFSET
+            b = np.asarray(b) - self.arm.MODEL_OFFSET
+            if np.all(a < high) and np.all(b > low):
+                return False
+        return True
+
+    def top_layer(self) -> int:
+        return max(b.layer for b in self.tower.blocks if b.status != "extracted")
+
+    def _restack(self, block: Block, front_center: np.ndarray, normal: np.ndarray,
+                 displacement: float, trajectory: list) -> dict[str, Any]:
+        """Pull a partly pushed block out from behind and place it on top.
+
+        `front_center` and `normal` describe the face that was pushed (model
+        frame) and `displacement` how far the block moved. The tower turns
+        half a turn so the protruding end faces the robot; the finger camera
+        servos to that end, which gives its pose relative to the arm, and the
+        gripper grasps it there, pulls it out and places it on the top layer.
+        """
+        cfg = self.config
+        arm = self.arm
+        result: dict[str, Any] = {"stage": "", "place_error_mm": None, "place_yaw_deg": None}
+        push_axis = -normal
+        back_end = front_center + push_axis * (cfg.block_length + displacement)
+        angle = self.tower.table_angle() + math.pi
+        self.rotate_tower(angle)
+        predicted = self._rotate_xy(back_end, math.pi)
+
+        # Measure the protruding end with the finger camera (closed loop).
+        arm.use_tool("finger")
+        staging = arm.ik(self._tool_target(predicted, normal, cfg.staging_distance))
+        if staging is None:
+            result["stage"] = "ik_look"
+            block.status = "skipped"  # left half-pushed in the tower
+            return result
+        self._move_joints(staging, trajectory)
+        self._move_linear(self._tool_target(predicted, normal, cfg.approach_distance),
+                          cfg.approach_speed_m_s, trajectory)
+        if self.controller == "closed_loop":
+            reason, _, _ = self._servo(block, predicted, trajectory)
+            if reason:
+                result["stage"] = reason
+                block.status = "skipped"
+                return result
+            face = arm.tool_pose() @ invert_pose(tool_in_face(cfg.probe_clearance))
+        else:
+            # Open loop: one detection from the approach pose, no servoing.
+            obs = self._track(block, predicted, locked=False)
+            if obs is None:
+                result["stage"] = "tracking_lost"
+                block.status = "skipped"
+                return result
+            face = make_pose(face_frame(normal), obs.world_center)
+        self._move_linear(face @ tool_in_face(cfg.approach_distance), cfg.approach_speed_m_s, trajectory)
+
+        # Grasp: the gripper's frame has the finger's orientation for this face.
+        inset = displacement - cfg.grasp_tip_gap - self.JAW_TIP_BEYOND_GRASP
+        if inset < 0.012:
+            result["stage"] = "too_little_protrusion"
+            block.status = "skipped"  # left half-pushed in the tower
+            return result
+        arm.use_tool("gripper")
+        arm.set_gripper(arm.GRIPPER_OPEN)
+        pre_grasp = face @ tool_in_face(0.10)
+        q = arm.ik(pre_grasp, valid=lambda q_: self._arm_clear_of_tower(q_, exclude=block))
+        if q is None:
+            result["stage"] = "ik_grasp"
+            block.status = "skipped"  # left half-pushed in the tower
+            arm.use_tool("finger")
+            return result
+        self._move_joints(q, trajectory)
+        raise_grip = np.array([0.0, 0.0, cfg.grasp_height_offset])
+        grasp = face @ tool_in_face(-inset)
+        grasp[:3, 3] += raise_grip
+        self._move_linear(grasp, 0.02, trajectory)
+        arm.set_gripper(0.0)
+        self._hold(1.0)
+        width = arm.gripper_width()
+        result["grasp_width_mm"] = width * 1000.0
+        if not 0.6 * cfg.block_width < width < 1.4 * cfg.block_width:
+            arm.set_gripper(arm.GRIPPER_OPEN)
+            self._move_linear(pre_grasp, 0.03, trajectory)
+            arm.use_tool("finger")
+            result["stage"] = "grasp_missed"
+            block.status = "skipped"  # left half-pushed in the tower
+            return result
+        self._lock_grasp(block)
+
+        # Pull straight out along the block, well clear of the turning tower.
+        pulled = face @ tool_in_face(-inset + (cfg.block_length - displacement) + 0.08)
+        pulled[:3, 3] += raise_grip
+        self._pull_out(block, pulled, 0.02, trajectory)
+        grip = arm.true_link_pose(arm.grip_link)[:3, 3]
+        if np.linalg.norm(self.tower.pose(block)[0] - grip) > cfg.block_length:
+            self._unlock_grasp()
+            arm.set_gripper(arm.GRIPPER_OPEN)
+            arm.use_tool("finger")
+            result["stage"] = "dropped_in_pull"
+            self._hold(0.5)
+            if not self.tower.has_fallen(block) and np.linalg.norm(
+                    self.tower.table_pose(block)[0][:2] - self.tower.initial_poses[block.block_id][0][:2]) < 0.04:
+                block.status = "skipped"  # still in the tower
+            else:
+                self.tower.remove(block)
+            return result
+
+        # Place on top: choose the table angle that lines the new layer up
+        # with the held block (its axis is the approach direction).
+        h = cfg.block_height
+        layer = self.top_layer()
+        in_top = [b for b in self.tower.blocks if b.layer == layer and b.status != "extracted"]
+        taken = {b.slot for b in in_top}
+        if len(in_top) >= cfg.blocks_per_layer or (layer >= cfg.layers and set(cfg.restack_slots) <= taken):
+            layer += 1
+            in_top, taken = [], set()
+        slot = next(s_ for s_ in cfg.restack_slots if s_ not in taken)
+        # Where the top of the tower is, as measured at this attempt's overview.
+        top = getattr(self, "top_origin", self.map.origin)
+        top_z = top[2] + h * layer
+        approach = face[:3, :3] @ np.array([0.0, 0.0, -1.0])  # into the tower
+        current = self.tower.table_angle()
+        table_axis = np.array([1.0, 0.0, 0.0]) if layer % 2 == 0 else np.array([0.0, 1.0, 0.0])
+        def alignment(theta_: float) -> float:
+            world_axis = self.map._yaw(theta_) @ table_axis
+            return abs(float(np.dot(world_axis[:2], approach[:2]))) / max(float(np.linalg.norm(approach[:2])), 1e-9)
+        candidates = [current + k * math.pi / 2 for k in range(-2, 3)]
+        best = max(alignment(t) for t in candidates)
+        theta = min((t for t in candidates if alignment(t) > best - 1e-6), key=lambda t: abs(t - current))
+        result["place_alignment"] = best
+        pitch = cfg.block_width + cfg.block_gap_m + cfg.place_gap
+        offset = (slot - (cfg.blocks_per_layer - 1) / 2) * pitch
+        local = (np.array([0.0, offset, 0.0]) if layer % 2 == 0 else np.array([offset, 0.0, 0.0]))
+        origin = np.array([top[0], top[1], 0.0])
+        target_center = self._rotate_xy(origin + local, theta) + np.array([0.0, 0.0, top_z + h / 2])
+        rotation = (face @ tool_in_face(0.0))[:3, :3]  # gripper orientation for this face
+        clear = lambda q_: self._arm_clear_of_tower(q_, exclude=block)
+        if abs(theta - current) > 1e-6:
+            self.rotate_tower(theta)
+        # The jaws are wider than the gap to a neighbouring block, so next to
+        # a neighbour the block is set down sticking out towards the robot,
+        # held by its end beyond the tower's edge, and then slid into its slot
+        # with the finger. Its centre of mass stays over the tower meanwhile.
+        neighbour = any(abs(s_ - slot) == 1 for s_ in taken)
+        slide = inset + self.JAW_TIP_BEYOND_GRASP + 0.006 if neighbour else 0.0
+        set_down = target_center - approach * slide
+        place = set_down - approach * (cfg.block_length / 2 - inset) + raise_grip
+        # Approach the top from outside the tower, then move in over it.
+        above_out = make_pose(rotation, place - approach * 0.12 + np.array([0.0, 0.0, 0.03]))
+        q = arm.ik(above_out, valid=clear)
+        if q is None:
+            result["stage"] = "ik_place"
+            self._unlock_grasp()
+            arm.set_gripper(arm.GRIPPER_OPEN)
+            arm.use_tool("finger")
+            self._hold(0.5)
+            self.tower.remove(block)  # released outside the tower: out of the game
+            return result
+        self._move_joints(q, trajectory)
+        self._move_linear(make_pose(rotation, place + np.array([0.0, 0.0, 0.03])), 0.03, trajectory)
+        # Guarded descent: lower until the top of the tower takes the block's
+        # weight off the jaws, rather than trusting the measured height.
+        weight = cfg.block_mass_kg * 9.81
+
+        def touched(index: int) -> Optional[str]:
+            return "contact" if float(self._held_force(block)[2]) + weight > 0.5 * weight else None
+
+        contact = self._move_linear(make_pose(rotation, place - np.array([0.0, 0.0, 0.015])), 0.005,
+                                    trajectory, touched)
+        result["place_contact"] = contact == "contact"
+        self._unlock_grasp()
+        arm.set_gripper(arm.GRIPPER_OPEN)
+        self._hold(0.8)
+        # Lift the open jaws clear before backing away: their lower edges sit
+        # about a millimetre above the top level and would snag it.
+        self._move_linear(make_pose(rotation, place + np.array([0.0, 0.0, 0.03])), 0.02, trajectory)
+        self._move_linear(make_pose(rotation, place - approach * 0.10 + np.array([0.0, 0.0, 0.05])), 0.05, trajectory)
+        arm.use_tool("finger")
+        block.layer, block.slot = layer, slot
+        block.long_axis = "x" if layer % 2 == 0 else "y"
+        if slide > 0:
+            result["slide"] = self._slide_in(block, set_down - approach * cfg.block_length / 2, -approach,
+                                             slide, trajectory)
+        self._hold(0.5)
+
+        # Score the placement against the nominal slot (true pose of the block).
+        position, rotation_true = self.tower.pose(block)
+        error = position - target_center
+        result["place_error_mm"] = float(np.linalg.norm(error[:2])) * 1000.0
+        along = approach[:2] / max(float(np.linalg.norm(approach[:2])), 1e-9)
+        result["place_error_along_mm"] = float(np.dot(error[:2], along)) * 1000.0
+        result["place_error_across_mm"] = float(np.cross(along, error[:2])) * 1000.0
+        result["place_height_error_mm"] = float(error[2]) * 1000.0
+        long_axis = rotation_true[:, 0]
+        yaw_error = math.degrees(math.acos(min(1.0, abs(float(np.dot(long_axis[:2] / max(np.linalg.norm(long_axis[:2]), 1e-9), approach[:2]))))))
+        result["place_yaw_deg"] = yaw_error
+        self.tower.initial_poses[block.block_id] = self.tower.table_pose(block)
+        result["stage"] = "placed"
+        result["layer"], result["slot"] = layer, slot
+        return result
+
     # ----- one attempt ------------------------------------------------------
     def run_attempt(self) -> Optional[AttemptResult]:
         cfg = self.config
@@ -1601,6 +2185,9 @@ class JengaSimulation:
             return None
         phase = self.policy.phase
         threshold = self.policy.force_threshold
+        level, slot = block.layer, block.slot
+        restack: Optional[dict[str, Any]] = None
+        front: Optional[np.ndarray] = None
         before = self.tower.snapshot()
         estimate = candidates[block.block_id]
         center = estimate.world_center
@@ -1630,12 +2217,23 @@ class JengaSimulation:
                 # has moved and an alignment error would be meaningless.
                 if not self.tower.has_collapsed(exclude=block.block_id):
                     alignment = self._alignment_error(block)
-                outcome, reason, peak, profile, displacement = self._push(block, threshold, trajectory)
+                front = self.arm.tool_pose() @ invert_pose(tool_in_face(cfg.probe_clearance))
+                outcome, reason, peak, profile, displacement = self._push(
+                    block, threshold, trajectory,
+                    stop_at=cfg.restack_push_distance if cfg.restack else None,
+                )
             back = self.arm.tool_pose()
             retreat = make_pose(back[:3, :3], back[:3, 3] - back[:3, 2] * (
                 cfg.approach_distance + max(0.0, displacement or 0.0)))
             self._move_linear(retreat, cfg.approach_speed_m_s, trajectory)
         self._hold(0.5)
+        if outcome == "partial":
+            restack = self._restack(block, front[:3, 3], front[:3, :3] @ np.array([0.0, 0.0, 1.0]),
+                                    displacement, trajectory)
+            if restack["stage"] == "placed":
+                outcome, reason = "extracted", ""
+            else:
+                outcome, reason = "error", "restack_" + restack["stage"]
         # A target that lost the finger and tipped out of the tower has been
         # extracted: in the paper such blocks fall out behind the tower.
         if (block.status != "extracted" and reason in ("push_incomplete", "push_jammed")
@@ -1646,14 +2244,14 @@ class JengaSimulation:
         # checks measure it from where it was left.
         collapsed = self.tower.has_collapsed(exclude=block.block_id)
         if block.status != "extracted":
-            self.tower.initial_poses[block.block_id] = self.tower.pose(block)
+            self.tower.initial_poses[block.block_id] = self.tower.table_pose(block)
         after = self.tower.snapshot()
         perturbation = max(
             (float(np.linalg.norm(after[k] - before[k]))
              for k in after if k in before and k != block.block_id),
             default=0.0,
         ) * 1000.0
-        self.policy.observe(block, outcome, peak)
+        self.policy.observe(block, outcome, peak, level=level)
         result = AttemptResult(
             trial=self.trial_index,
             seed=self.seed,
@@ -1661,8 +2259,8 @@ class JengaSimulation:
             controller=self.controller,
             attempt=len(self.attempts),
             block_id=block.block_id,
-            layer=block.layer,
-            slot=block.slot,
+            layer=level,
+            slot=slot,
             phase=phase,
             threshold_n=threshold,
             outcome=outcome,
@@ -1678,6 +2276,8 @@ class JengaSimulation:
             tower_perturbation_mm=perturbation,
             tower_collapsed=collapsed,
             sim_time_s=self.sim_time - start_time,
+            restack_stage="" if restack is None else restack["stage"],
+            place_error_mm=None if restack is None else restack.get("place_error_mm"),
             trajectory=trajectory,
             force_profile=profile,
         )
@@ -1782,6 +2382,10 @@ def aggregate(results: Sequence[AttemptResult]) -> dict[str, Any]:
         "immobile_per_trial": mean_std_ci(per_trial["immobile"]),
         "errors_per_trial": mean_std_ci(per_trial["errors"]),
         "longest_success_streak_per_trial": mean_std_ci(per_trial["longest_streak"]),
+        # Restacking runs only: pull-and-place attempts and placement accuracy.
+        "restack_attempts": sum(bool(r.restack_stage) for r in results),
+        "restack_placed": sum(r.restack_stage == "placed" for r in results),
+        "place_error_mm": mean_std_ci([r.place_error_mm for r in results if r.place_error_mm is not None]),
         "alignment_error_mm": mean_std_ci([r.alignment_error_mm for r in aligned]),
         "alignment_error_h_mm": mean_std_ci([r.alignment_error_h_mm for r in aligned]),
         "alignment_error_v_mm": mean_std_ci([r.alignment_error_v_mm for r in aligned]),
@@ -1975,6 +2579,9 @@ def main() -> None:
     parser.add_argument("--joint-bias-deg", type=float,
                         default=math.degrees(SimulationConfig.joint_bias_std_rad),
                         help="Std of joint encoder offsets (robot calibration error).")
+    parser.add_argument("--restack", action="store_true",
+                        help="Full game: pull pushed blocks out from behind and stack them on top "
+                             "(Panda gripper with the push finger on its side, turntable).")
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="GUI playback speed as a multiple of real time; 0 = as fast as possible.")
@@ -1992,6 +2599,7 @@ def main() -> None:
             block_friction_range=(args.friction_min, args.friction_max),
             block_height_tolerance_m=args.height_tolerance_mm / 1000,
             joint_bias_std_rad=math.radians(args.joint_bias_deg),
+            **({"end_effector": "combined", "turntable": True, "restack": True} if args.restack else {}),
         )
     except ValueError as error:
         parser.error(str(error))
