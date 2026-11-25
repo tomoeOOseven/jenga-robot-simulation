@@ -1,4 +1,4 @@
-# Jenga-playing robot: simulated replication in PyBullet
+# Jenga-playing Robot: Simulated Replication in PyBullet
 
 A PyBullet replication of Marchionna et al. (2023), *Deep Instance Segmentation
 and Visual Servoing to Play Jenga with a Cost-Effective Robotic System*
